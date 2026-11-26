@@ -1,2026 +1,875 @@
-# Reward-Guided Latent Diffusion for Multivariate Financial Trajectory Forecasting
+# Generator-Coupled Adaptive Source Distribution Learning for Direct Patched Flow Matching DiTs in Multivariate Financial Forecasting
 
-## Complete architecture and mathematical training specification
+## Version 4.3 (Final Locked Specification & Engineering Implementation Plan)
 
-**Proposed training strategy:** Alternating prior–generator optimization with a moving learned-prior reference, KL trust-region regularization, and separate exponential moving average (EMA) networks.
+**Generative core:** Conditional Flow Matching (CFM) operating directly in patched normalized return space, parameterized by a full spatiotemporal Diffusion Transformer (DiT) velocity field and integrated in FP32 via ODE solvers.
 
----
+**Core research mechanism:** Alternating prior–generator optimization where a context-dependent, conditionally factorized Gaussian source prior $P_\psi(\xi_0 \mid h_t)$ is jointly shaped by strictly proper Gaussian NLL, consistent local distributional transport (debiased Sinkhorn Divergence / Monte Carlo Sliced Wasserstein-2), and a **generator-dependent constant-velocity straightness policy gradient** (unbiased prior to gradient clipping), regularized by a moving-reference per-coordinate KL trust region and separate EMA snapshots.
 
-## Abstract
+**Core research question:**
 
-This document specifies a generative forecasting architecture for multivariate financial time series. Given a historical window of data for multiple stocks, the system learns a representation of the current market, generates a distribution of possible future trajectories using a conditional latent Diffusion Transformer (DiT), and progressively adapts the diffusion model's initial-noise distribution using trajectory-quality feedback.
+> Can generator-dependent adaptation of a conditional source distribution, combined with context-aware source–target coupling and alternating Flow Matching optimization, reduce the number of ODE evaluations required for calibrated multivariate financial trajectory forecasting without degrading out-of-sample probabilistic quality?
 
-The architecture contains five principal learned components:
+**Three falsifiable research claims:**
 
-1. A **historical market encoder** that represents temporal patterns, cross-stock relationships, and broader market conditions.
-2. A **future trajectory autoencoder** that maps observed future trajectories into a compact latent space and reconstructs them from that space.
-3. A **conditional latent DiT** that learns to generate future latent trajectories from a noisy terminal latent and historical context.
-4. A **conditional terminal prior** that learns which initial diffusion-latent regions are useful for a given historical market context.
-5. A **reward evaluator** that scores generated trajectories using ground-truth forecasting error and financial distributional properties during training.
-
-The key optimization proposal is not to update the prior and generator simultaneously. Training alternates between two blocks:
-
-- **Prior block:** freeze a snapshot of the generator and update the conditional terminal prior using reward-ranked samples. Regularize the new prior against the previous iteration's learned prior, not permanently against the original standard Gaussian.
-- **Generator block:** freeze the newly adapted and previous prior snapshots, sample from a fixed mixture of these priors, and update the DiT and trajectory decoder using diffusion, reconstruction, and reward-based objectives.
-
-Separate EMA copies provide stable sampling and reference networks. A moving-reference KL trust region limits how far the prior can move in one outer iteration, while the generator receives a dedicated optimization block to adapt to the updated sampling distribution.
-
-The central research question is:
-
-> Can progressive adaptation of a context-dependent diffusion terminal prior, coupled with alternating reward-guided optimization of a conditional latent diffusion generator, improve multivariate financial trajectory forecasting while preserving forecast calibration, cross-asset dependencies, and ensemble diversity?
-
-This is a proposed research design, not a claim that the method is guaranteed to outperform standard diffusion. Its value must be established through controlled ablations and chronological out-of-sample evaluation.
+1. **Transport efficiency:** Adaptive source priors combined with transport-aware coupling reduce coupling-indexed source-to-target displacement and discrete constant-velocity straightness cost relative to a fixed standard Gaussian source.
+2. **Sampling efficiency:** Alternating generator-coupled optimization improves the NFE-versus-forecast-quality Pareto frontier (e.g., matching $32$-NFE Gaussian CFM quality at $8$ NFE) relative to both standard Gaussian CFM and a compute-matched two-stage sequential prior baseline.
+3. **Forecast preservation & value added:** These efficiency gains preserve out-of-sample probabilistic calibration, cross-asset dependence, and financial tail realism, while outperforming direct prior-only forecasting (Experiment R) on joint multivariate structure.
 
 ---
 
-# 1. Problem definition and notation
+## Final Lock Changelog (v4.2 $\rightarrow$ v4.3 Final)
 
-## 1.1 Forecasting task
+All six pre-implementation corrections and early-implementation numerical safeguards are now locked into the specification:
 
-Suppose the dataset contains historical observations for `N` stocks. At prediction date `t`, the model observes the previous `L` trading days and generates possible trajectories for the next `H` trading days.
-
-The historical input is:
-
-\[
-X_t^{\mathrm{past}} \in \mathbb{R}^{L\times N\times F},
-\]
-
-where:
-
-- `L` is the lookback length;
-- `N` is the number of assets;
-- `F` is the number of historical features per asset.
-
-The future target is:
-
-\[
-Y_t^{\mathrm{future}} \in \mathbb{R}^{H\times N\times F_y}.
-\]
-
-For the first implementation, use `F_y = 1` and predict normalized daily log returns. Additional targets, such as realized volatility or volume changes, can be added later.
-
-The system does not produce only one deterministic forecast. For a given historical context it generates an ensemble:
-
-\[
-\hat Y_t^{(1)},\hat Y_t^{(2)},\ldots,\hat Y_t^{(M)},
-\]
-
-where each member is a possible future trajectory for all modeled stocks.
-
-The goal is to model the conditional distribution of future market trajectories, not merely to minimize the error of one selected path.
-
-## 1.2 Notation table
-
-| Symbol | Meaning |
-|---|---|
-| `X_t` | Historical input window ending at date `t` |
-| `Y_t` | Ground-truth future trajectory after date `t` |
-| `h_t` | Encoded historical market context |
-| `z_0` | Clean latent encoding of a future trajectory |
-| `z_k` | Noisy latent at forward/reverse diffusion step `k` |
-| `z_K` | Terminal latent used to initialize reverse diffusion |
-| `η` | Gaussian noise added by the forward diffusion process |
-| `E_φ` | Historical market encoder with parameters `φ` |
-| `Q_χ` | Future trajectory encoder / VAE posterior with parameters `χ` |
-| `D_ω` | Future trajectory decoder with parameters `ω` |
-| `R_θ` | Reverse diffusion process implemented by the DiT, parameters `θ_D` |
-| `G_θ` | Complete latent generator: reverse DiT plus trajectory decoder |
-| `P_ψ` | Learnable conditional terminal prior with parameters `ψ` |
-| `\bar ψ` | EMA parameters of the conditional prior |
-| `\bar θ` | EMA parameters of the complete generator |
-| `b` | Outer prior–generator optimization iteration |
-| `M` | Number of candidate trajectories generated per context |
-| `K_e` | Number of elite trajectories selected for a sample-level update |
-
-## 1.3 Two distinct diffusion-noise variables
-
-It is essential to distinguish two kinds of noise.
-
-**Forward-process noise** is denoted by `η`:
-
-\[
-\eta\sim\mathcal N(0,I).
-\]
-
-It is added to a clean future latent during diffusion training. The DiT is trained to predict this noise (or an equivalent target such as velocity).
-
-**Terminal reverse-process latent** is denoted by `z_K`:
-
-\[
-z_K\sim P_\psi(z_K\mid h_t).
-\]
-
-It initializes the reverse diffusion process during generation. In a conventional diffusion model this is normally a standard Gaussian. The proposed research changes this terminal sampling distribution to a learnable context-dependent prior.
-
-These two variables are not interchangeable. The reward-guided prior adaptation acts on `z_K`, not on the forward-process noise `η` used to construct training pairs.
-
-There is also a separate VAE prior on the clean latent `z_0`. It is not automatically changed by adapting the diffusion terminal prior.
+* **Experiment R (Direct Prior-Only Baseline):** Added direct sampling $\hat{Y}_t^{(i)} = \mathcal{P}_p^{-1}(\xi_0^{(i)})$ from $P_\psi(\cdot \mid h_t)$ ($0$ NFE) into Stage 2 and the ablation matrix to isolate the exact multivariate dependence value added by the Flow Matching DiT.
+* **Symmetric Mixture-KL Runtime Mask:** Replaced directional $U(i, j)$ gating with the symmetric convexity upper bound $U_{\text{sym}}(i, j) = \frac{1}{2}[U(i, j) + U(j, i)]$ so cross-context compatibility is symmetric.
+* **Uniform Sinkhorn Marginals & Sparse-Support Fallback:** Explicitly defined $a = b = [1/B_g, \dots, 1/B_g]^\top$ for guaranteed diagonal feasibility ($\Pi = \operatorname{diag}(1/B_g)$), added dual-potential finiteness and marginal-error checks with automatic fallback to same-context pairing, normalized state/context costs before weighting by $\lambda_h$, and labeled the module explicitly as a **KL-constrained local conditional OT approximation**.
+* **Explicit Factored Variogram Score Formula:** Locked down exact pairwise discrepancy $d_p(a, b)$, cardinality normalization across $\mathcal{S}_{\text{temp}}$, $\mathcal{S}_{\text{asset}}$, and $\mathcal{S}_{\text{cross}}$, and fixed validation vs. resampled training pair protocols.
+* **Strict Past-Only Volatility Floor:** Moved estimation of $s_{\min, i}$ into a read-only initial calibration prefix ($T_{\text{cal}} = 252$ trading days) prior to the first training origin ($t \ge T_{\text{cal}} + L$) so the zero-leakage perturbation test holds identically on every prediction date.
+* **RLOO Unbiasedness Qualification & Numerical Hygiene:** Explicitly qualified that RLOO is unbiased *prior to nonlinear gradient clipping* (`clip_grad_norm_`), added clipping-activation telemetry, enforced FP32 ODE states/updates/accumulators even under BF16 DiT autocast, bumped validation MC mixture-KL estimates to $S = 128$ samples with standard-error reporting, and integrated a complete **Implementation Plan** (Section 11).
 
 ---
 
-# 2. Dataset construction and financial preprocessing
+# 1. Problem Definition, Direct Configurable Patching, and Notation
 
-## 2.1 Initial dataset scope
+## 1.1 Multivariate Forecasting Task
 
-A practical first experiment can use approximately 30–50 liquid equities from one market, such as Indian equities. The universe can be expanded after the full pipeline works.
+For $N$ equities at trading date $t$, the model observes a historical window of $L$ trading days and generates an ensemble of $M$ joint future return trajectories over the next $H$ trading days:
 
-Possible data sources include:
+$$
+X_t^{\text{past}} \in \mathbb{R}^{L \times N \times F}, \qquad Y_t^{\text{future}} \in \mathbb{R}^{H \times N \times 1}, \qquad \left\{\hat{Y}_t^{(1)}, \dots, \hat{Y}_t^{(M)}\right\} \subset \mathbb{R}^{H \times N \times 1}.
+$$
 
-- [NSE historical reports](https://www.nseindia.com/all-reports)
-- [Yahoo Finance](https://finance.yahoo.com/)
-- [Alpha Vantage](https://www.alphavantage.co/)
-- [FRED](https://fred.stlouisfed.org/) for macroeconomic series
+Default initial dimensions are $L = 60$, $H = 20$, $N = 50$, and $F = 12$ compact historical features per asset.
 
-Daily data is sufficient for the initial research question. Intraday order-book data is not required.
+## 1.2 Lossless Direct Temporal Patching Operator (No VAE)
 
-## 2.2 Candidate input features
+Because $Y_t^{\text{future}}$ contains only $H \cdot N \cdot 1 = 1,000$ scalar values, a latent autoencoder is unnecessary and introduces reconstruction bias and posterior-collapse risk. Define a lossless temporal patching operator $\mathcal{P}_p$ with configurable patch length $p \in \{1, 2, 4\}$ (where $H_p = H / p \in \mathbb{Z}^+$):
 
-| Feature group | Example features | Purpose |
+$$
+Y_t^{\text{patch}} = \mathcal{P}_p(Y_t^{\text{future}}) \in \mathbb{R}^{H_p \times N \times p},
+$$
+
+where token $(k, i)$ for temporal patch $k \in \{0, \dots, H_p - 1\}$ and asset $i \in \{1, \dots, N\}$ is:
+
+$$
+Y_{t, k, i}^{\text{patch}} = \begin{bmatrix} \tilde{r}_{i, t + pk + 1} & \tilde{r}_{i, t + pk + 2} & \cdots & \tilde{r}_{i, t + pk + p} \end{bmatrix}^\top \in \mathbb{R}^p.
+$$
+
+The inverse unpatchification operator $\mathcal{P}_p^{-1}: \mathbb{R}^{H_p \times N \times p} \to \mathbb{R}^{H \times N \times 1}$ is a zero-parameter reshape/transpose. Across all patch sizes, the total flow state dimensionality stays identically $D = H_p \cdot N \cdot p = 1,000$:
+
+| Patch Size $p$ | Temporal Patches $H_p$ | Total DiT Tokens $T_{\text{tok}} = H_p N$ | Attention Matrix Entries | Flow State Dim $D$ | Role |
+|---|---|---|---|---|---|
+| $p = 4$ | $5$ | $250$ | $62,500$ | $1,000$ | Default starting point (fastest) |
+| $p = 2$ | $10$ | $500$ | $250,000$ | $1,000$ | Primary granularity ablation |
+| $p = 1$ | $20$ | $1,000$ | $1,000,000$ | $1,000$ | Full daily-token upper bound |
+
+## 1.3 Complete Notation Table
+
+| Symbol | Shape / Domain | Definition |
 |---|---|---|
-| Price | Open, high, low, close | Price movement and daily range |
-| Returns | Daily and multi-day log returns | Return dynamics |
-| Volume | Volume, log-volume change, turnover | Trading activity |
-| Volatility | Rolling volatility, downside volatility | Market uncertainty |
-| Momentum | 5-, 20-, and 60-day momentum | Short/medium-term patterns |
-| Market | Broad index returns and volatility | Market-wide context |
-| Sector | Sector-index returns | Sector-level behaviour |
-| Fundamentals | Point-in-time valuation and earnings features | Company characteristics |
-| Macro | Rates, inflation, currency, commodities | Economic context |
-
-Start with a compact feature set: returns, volume changes, high–low range, rolling volatility, momentum, broad-market returns, and sector returns. Fundamentals and macroeconomic variables can be added after the base model is established.
-
-## 2.3 Return transformation and scaling
-
-Raw stock prices have very different scales. Use adjusted prices and calculate log returns:
-
-\[
-r_{i,t}=\log\left(\frac{P_{i,t}}{P_{i,t-1}}\right),
-\]
-
-where `P_{i,t}` is the appropriately adjusted price for asset `i` at time `t`.
-
-Estimate a rolling volatility scale using only information available by time `t`:
-
-\[
-s_{i,t}=\sqrt{\frac{1}{W-1}
-\sum_{u=t-W+1}^{t}(r_{i,u}-\bar r_{i,t})^2+\varepsilon}.
-\]
-
-A normalized historical return is:
-
-\[
-\tilde r_{i,t}=\frac{r_{i,t}}{s_{i,t}}.
-\]
-
-For a future target after prediction date `t`, use the scale estimated at `t`:
-
-\[
-\tilde r_{i,t+h}=\frac{r_{i,t+h}}{s_{i,t}},\qquad h=1,\ldots,H.
-\]
-
-Do not normalize a future target using statistics calculated from that future period. The future target must be scaled only using information known at the prediction date.
-
-The original scale `s_{i,t}` can also be supplied as an input feature. At inference, generated normalized returns can be converted back to log returns using the known historical scale.
-
-## 2.4 Rolling-window examples
-
-For each valid prediction date `t`, construct:
-
-\[
-X_t=[X_{t-L+1},\ldots,X_t]
-\]
-
-and:
-
-\[
-Y_t=[Y_{t+1},\ldots,Y_{t+H}].
-\]
-
-The dataset is:
-
-\[
-\mathcal D=\{(X_t,Y_t)\}_{t\in\mathcal T}.
-\]
-
-Example initial dimensions:
-
-- Lookback `L = 60` trading days.
-- Horizon `H = 20` trading days.
-- Assets `N = 50`.
-- Historical features `F = 10–15`.
-- Future output features `F_y = 1` (normalized return).
-
-Then:
-
-\[
-X_t\in\mathbb R^{60\times50\times F},
-\qquad
-Y_t\in\mathbb R^{20\times50\times1}.
-\]
-
-## 2.5 Leakage and survivorship controls
-
-The dataset must be split chronologically into training, validation, and test periods. Use a purge or temporal gap around split boundaries when target windows overlap.
-
-Required controls:
-
-1. Use adjusted prices and correctly handle splits, dividends, and other corporate actions.
-2. Use point-in-time index constituents where possible; do not assume today's index membership applied historically.
-3. Use fundamentals only after their actual publication dates.
-4. Fit normalization parameters on training data or using past-only rolling estimates.
-5. Ensure the encoder at date `t` cannot access observations after `t`.
-6. Ensure reward calculations use the subsequent target only during training or validation, never as an inference input.
+| $X_t$ | $\mathbb{R}^{L \times N \times F}$ | Historical input window ending at date $t$ |
+| $Y_t^{\text{patch}}$ | $\mathbb{R}^{H_p \times N \times p}$ | Ground-truth patched future normalized log returns ($D = 1,000$) |
+| $h_t$ | $(h_t^{\text{stocks}}, h_t^{\text{global}})$ | Encoded historical market context: $\mathbb{R}^{N \times d_h}$ and $\mathbb{R}^{d_h}$ |
+| $\xi_0$ | $\mathbb{R}^{H_p \times N \times p}$ | Initial source sample drawn from $P_\psi(\cdot \mid h_t)$ |
+| $z_\tau$ | $\mathbb{R}^{H_p \times N \times p}$ | Interpolated flow state at continuous time $\tau \in [0, 1]$ |
+| $z(1)$ | $\mathbb{R}^{H_p \times N \times p}$ | Terminal ODE state at $\tau = 1$ (reserving $K$ strictly for ODE step count) |
+| $u^*$ | $\mathbb{R}^{H_p \times N \times p}$ | Conditional linear target velocity $Y_t^{\text{patch}} - \xi_0$ |
+| $E_\phi$ | Module | Historical market encoder (Temporal Transformer + Signed-Edge GATv2 + AttentionPool) |
+| $P_\psi, P_{\bar{\psi}}$ | Module | Online and EMA conditionally factorized Gaussian source priors |
+| $v_\theta, v_{\bar{\theta}}$ | Module | Online and EMA Flow Matching DiT velocity fields (includes output projection) |
+| $G_\theta$ | Operator | Complete FP32 ODE integration $\xi_0 \mapsto z(1)$ followed by unpatchification $\mathcal{P}_p^{-1}$ |
+| $P_{\text{ref}}^{(b)}$ | Frozen snapshot | Previous outer iteration's EMA prior $P_{\bar{\psi}^{(b)}}$ |
+| $q_b$ | Frozen mixture | Block B source mixture $\rho P_{\text{new}}^{(b)} + (1 - \rho) P_{\text{old}}^{(b)}$ |
+| $b$ | $\mathbb{Z}_{\ge 0}$ | Outer alternating optimization iteration |
+| $K$ | $\mathbb{Z}^+$ | Number of fixed-step ODE solver steps |
+| $M$ | $\mathbb{Z}^+$ | Candidate rollouts per context ($M \in \{20, 64, 128\}$; even when using antithetic pairs) |
+| $\operatorname{sg}(\cdot)$ | Operator | Stop-gradient (`.detach()`), blocking backpropagation through its argument |
 
 ---
 
-# 3. Historical financial representation encoder
+# 2. Financial Data Pipeline, Causal Volatility Floor, and Leakage Controls
 
-The historical encoder should represent three complementary aspects of the market:
+## 2.1 Universe and Compact Feature Set
 
-1. Individual stock temporal dynamics.
-2. Relationships between stocks.
-3. Global market conditions.
+Start with $N = 30\text{--}50$ liquid equities (e.g., Indian equities via NSE historical archives / adjusted daily feeds). Use a compact $F = 12$ feature vector per asset per day:
 
-The recommended initial encoder combines a temporal Transformer, a graph encoder, and a market-context encoder.
+1. Daily adjusted log return $r_{i,t}$ and normalized return $\tilde{r}_{i,t}$.
+2. Log high–low range $\log(H_{i,t}/L_{i,t})$ and open–close return $\log(C_{i,t}/O_{i,t})$.
+3. Log volume change $\log((V_{i,t} + 1)/(V_{i,t-1} + 1))$.
+4. Past-only rolling volatility $s_{i,t}$ ($20$-day) and downside semi-volatility ($20$-day).
+5. Multi-horizon momentum: $5$-day, $20$-day, and $60$-day cumulative log returns.
+6. Broad market index log return and sector index log return.
 
-## 3.1 Temporal encoder
+## 2.2 Strictly Causal Volatility Floor & Past-Only Scaling
 
-For stock `i`, extract its historical sequence:
+Compute adjusted daily log returns:
 
-\[
-X_{t,i}\in\mathbb R^{L\times F}.
-\]
+$$
+r_{i,t} = \log\left(\frac{P_{i,t}^{\text{adj}}}{P_{i,t-1}^{\text{adj}}}\right).
+$$
 
-A temporal Transformer processes it:
+**Calibration-prefix floor (Zero-Leakage Resolution):** Reserve the first $T_{\text{cal}} = 252$ trading days of the dataset strictly as a read-only calibration prefix. Compute each asset's volatility floor $s_{\min, i}$ as the $5\text{th}$ percentile of its $20$-day rolling volatility over $t \in [W, T_{\text{cal}}]$ and freeze $s_{\min}$ permanently. Begin all training prediction origins strictly at $t \ge T_{\text{cal}} + L$.
 
-\[
-u_{t,i}=T_\phi(X_{t,i}).
-\]
+For every valid prediction origin $t$, compute the strictly causal rolling volatility scale over window $W = 20$ trading days ending at $t$:
 
-The temporal encoder can capture momentum, volatility changes, temporal dependencies, and recurring patterns. Positional embeddings should identify the order of historical observations.
+$$
+s_{i,t} = \max\left(s_{\min, i},\; \sqrt{\frac{1}{W - 1}\sum_{u = t - W + 1}^{t}(r_{i,u} - \bar{r}_{i,t})^2 + \varepsilon}\right).
+$$
 
-The output can be one vector per stock or a sequence of temporal tokens. A pooled vector per stock is sufficient for an initial graph model; retaining temporal tokens gives the later DiT richer conditioning information.
+Normalize historical returns and future targets using only information available at or before date $t$:
 
-## 3.2 Cross-stock graph encoder
+$$
+\tilde{r}_{i,t} = \frac{r_{i,t}}{s_{i,t}}, \qquad \tilde{r}_{i, t + h} = \frac{r_{i, t + h}}{s_{i,t}} \quad (h = 1, \dots, H).
+$$
 
-Represent the market as a time-dependent graph:
+Do **not** clip raw targets in evaluation datasets; always evaluate on unclipped raw log returns and reconstructed price paths.
 
-\[
-G_t=(V,E_t),
-\]
+## 2.3 Chronological Splits, Purge Gaps, and Overlap Stride Controls
 
-where each node represents a stock and edges represent statistical or learned relationships.
-
-Let:
-
-\[
-A_t\in\mathbb R^{N\times N}
-\]
-
-be the adjacency or edge-weight matrix. A simple baseline is a rolling correlation graph constructed entirely from the historical input window. Later alternatives include partial-correlation graphs, transfer entropy, or learned edge weights.
-
-Apply a graph neural network:
-
-\[
-v_{t,i}=\operatorname{GNN}_\phi(u_{t,i},A_t).
-\]
-
-This allows each stock representation to incorporate information from related stocks.
-
-**Interpretation caution:** Correlation and predictive lead–lag relationships do not, by themselves, establish economic causation.
-
-## 3.3 Global market-context encoder
-
-Pool the stock representations to form a market-level summary:
-
-\[
-g_t=\operatorname{AttentionPool}(v_{t,1},\ldots,v_{t,N}).
-\]
-
-Then calculate a contextual market embedding:
-
-\[
-m_t=M_\phi(g_t).
-\]
-
-This representation can capture broad market volatility, market breadth, cross-sector dependence, and latent market regimes without requiring manually assigned bull/bear labels.
-
-## 3.4 Fusion and final context
-
-The final historical representation is:
-
-\[
-\boxed{h_t=E_\phi(X_t)=\operatorname{Fusion}
-(u_{t,1:N},v_{t,1:N},m_t).}
-\]
-
-It is useful to preserve both stock-level tokens and a global token. For example:
-
-\[
-h_t\in\mathbb R^{(N+1)\times d},
-\]
-
-where `d` is the embedding dimension. The global token can condition the prior, while stock-level tokens can be supplied to the DiT through cross-attention.
-
-## 3.5 Training the historical encoder
-
-Initially, the encoder can be trained jointly with the baseline autoencoder/diffusion forecasting system. Optional self-supervised objectives include:
-
-- Masked financial-feature reconstruction.
-- Contrastive learning across two views of the same historical window.
-- Prediction of historical summary statistics.
-
-For the first reward-guided prior–generator experiments, freeze the historical encoder. This avoids introducing a third moving component while studying prior–generator optimization. Fine-tuning the encoder can be a later ablation.
+1. **Strict chronological partitions:** Calibration prefix ($252$ days) $\rightarrow$ Train (e.g., 2012--2020) $\rightarrow$ Validation (2021--2022) $\rightarrow$ Test (2023--2025).
+2. **Boundary purge:** Drop $25$ trading days ($> H = 20$) immediately after the last training prediction date and after the last validation prediction date so zero target days cross a partition boundary.
+3. **Automated zero-leakage unit test:** Perturbing all market observations strictly after date $t$ must change $X_t$, $s_{i,t}$, and the historical graph adjacency matrix $A_t$ by identically `0.0` for every prediction origin $t$ across train, validation, and test.
+4. **Target overlap reduction in Block A:** Because a $20$-day horizon at stride $S = 1$ shares $95\%$ of target days across adjacent windows, Block A samples windows using stride $S \in \{5, 10, 20\}$ with a randomized epoch starting offset $o \in \{0, \dots, S - 1\}$. Stride $S = 5$ reduces overlap to $(20 - 5)/20 = 75\%$; non-overlapping targets occur at $S = 20$. Compare $S \in \{5, 10, 20\}$ empirically.
+5. **Survivorship control:** Use point-in-time historical index constituents where available; otherwise explicitly document fixed-universe selection bias.
 
 ---
 
-# 4. Future trajectory autoencoder and latent representation
+# 3. Historical Market Representation Encoder ($E_\phi$)
 
-The future trajectory autoencoder maps an observed future into a compact latent representation during training and reconstructs the trajectory from that representation.
+The historical encoder $E_\phi$ maps $X_t \in \mathbb{R}^{L \times N \times F}$ into structured stock-level and global conditioning tokens.
 
-This creates the target latent space for the diffusion model.
+## 3.1 Three-Stage Architecture
 
-## 4.1 Future trajectory encoder
+1. **Per-Asset Temporal Transformer:** Project each asset's history $X_{t, i} \in \mathbb{R}^{L \times F}$ to width $d_h = 128$, add learned temporal positional embeddings, apply $L_{\text{temp}} = 2\text{--}3$ Transformer encoder layers, and attention-pool over the $L$ days to obtain $u_{t,i} \in \mathbb{R}^{d_h}$.
+2. **Cross-Stock Signed-Edge Shrinkage Graph Encoder:** Construct a strictly past-only $N \times N$ correlation matrix $A_t$ from the $60$-day lookback returns using Ledoit–Wolf shrinkage. Represent each retained top-$k$ edge $(i, j)$ using a **signed edge feature vector** $e_{ij}^{\text{edge}} = \big[\max(A_{t,ij}, 0),\; \max(-A_{t,ij}, 0),\; |A_{t,ij}|\big] \in \mathbb{R}^3$ fed into $L_{\text{gnn}} = 2$ edge-conditioned GATv2 layers over $\{u_{t,i}\}_{i=1}^N$ to obtain relational embeddings $v_{t,i} \in \mathbb{R}^{d_h}$. Monitor edge sparsity and correlation-graph stability across market regimes.
+3. **Global Market-Context Pooling & Fusion:** Aggregate across all $N$ assets via multi-head attention pooling:
 
-During training, the actual future trajectory `Y_t` is available. The future encoder produces a conditional posterior:
+$$
+h_t^{\text{global}} = \operatorname{MLP}_\phi\big(\operatorname{AttentionPool}(v_{t,1}, \dots, v_{t,N})\big) \in \mathbb{R}^{d_h},
+$$
 
-\[
-q_\chi(z_0\mid Y_t,h_t)
-=
-\mathcal N\left(\mu_\chi(Y_t,h_t),
-\operatorname{diag}(\sigma_\chi^2(Y_t,h_t))\right).
-\]
+and fuse temporal, relational, and stock/sector identity embeddings into stock context tokens:
 
-Sample using reparameterization:
+$$
+h_{t, i}^{\text{stocks}} = \operatorname{LayerNorm}\big(u_{t,i} + v_{t,i} + e_i^{\text{stock}} + e_{\text{sec}(i)}^{\text{sector}}\big) \in \mathbb{R}^{d_h}.
+$$
 
-\[
-\boxed{z_0=\mu_\chi+\sigma_\chi\odot\xi,\qquad
-\xi\sim\mathcal N(0,I).}
-\]
+The encoder outputs $h_t = \big(h_t^{\text{stocks}} \in \mathbb{R}^{N \times d_h},\; h_t^{\text{global}} \in \mathbb{R}^{d_h}\big)$.
 
-Here, `z_0` is the clean latent representation of the future trajectory.
+## 3.2 Training and Freezing Protocol
 
-The future encoder is permitted to see `Y_t` during training because it constructs the diffusion target. It must not be used at inference, when the future is unknown.
-
-## 4.2 Trajectory decoder
-
-The trajectory decoder reconstructs the future:
-
-\[
-\hat Y_t=D_\omega(z_0,h_t).
-\]
-
-It can use temporal Transformer layers, cross-attention to historical context tokens, and cross-stock attention. Conditioning on `h_t` allows reconstruction to use both the compressed future latent and the known historical market context.
-
-## 4.3 VAE objective
-
-The negative evidence lower bound is:
-
-\[
-\boxed{
-\mathcal L_{\mathrm{VAE}}
-=
-\mathbb E_{z_0\sim q_\chi}
-[-\log p_\omega(Y_t\mid z_0,h_t)]
-+
-\beta_{\mathrm{VAE}}
-D_{KL}\left(q_\chi(z_0\mid Y_t,h_t)\Vert
-\mathcal N(0,I)\right).
-}
-\]
-
-For a fixed-variance Gaussian observation model, the reconstruction term is proportional to:
-
-\[
-\mathcal L_{\mathrm{recon}}
-=
-\|Y_t-D_\omega(z_0,h_t)\|_2^2.
-\]
-
-For a diagonal Gaussian posterior, the KL term is:
-
-\[
-D_{KL}(q_\chi\Vert\mathcal N(0,I))
-=
-\frac12\sum_j
-\left(\mu_j^2+\sigma_j^2-\log\sigma_j^2-1\right).
-\]
-
-The reconstruction term preserves trajectory information; the KL term regularizes the clean latent representation.
-
-## 4.4 Two different priors: VAE prior versus diffusion terminal prior
-
-The VAE regularizes the clean future latent `z_0` using:
-
-\[
-p_{\mathrm{VAE}}(z_0)=\mathcal N(0,I).
-\]
-
-The diffusion process has a terminal latent `z_K`, which conventionally follows:
-
-\[
-p_{\mathrm{diff}}(z_K)=\mathcal N(0,I).
-\]
-
-These are different variables and different distributions. The proposed adaptive prior changes the distribution used to initialize reverse diffusion (`z_K`). It does not automatically change the VAE prior on `z_0`.
-
-## 4.5 What is trained and frozen later?
-
-Pretrain the future encoder and decoder until reconstruction is adequate. Then freeze the future encoder `Q_χ` during the initial reward-guided experiments so that the target latent coordinate system remains stable.
-
-The trajectory decoder `D_ω` is allowed to be updated during generator optimization. Its original reconstruction objective remains active to prevent reward fine-tuning from damaging general reconstruction ability.
+Train $E_\phi$ jointly with the baseline Gaussian-source CFM DiT in Stage 1 (optionally warm-started with masked historical feature reconstruction). Once Stage 1 converges, **freeze $E_\phi$ permanently** across all prior-adaptation and alternating iterations so context neighborhoods, KL divergences, and transport distances remain anchored to a stationary representation space.
 
 ---
 
-# 5. Conditional latent Diffusion Transformer
+# 4. Conditionally Factorized Gaussian Source Prior ($P_\psi$)
 
-The DiT learns to transform noisy future latents into clean future latents, conditioned on the historical market representation.
+The source prior defines a context-dependent starting distribution directly in patched return space $\mathbb{R}^{H_p \times N \times p}$:
 
-## 5.1 Forward diffusion process
+$$
+P_\psi(\xi_0 \mid h_t) = \mathcal{N}\!\left(\mu_\psi(h_t),\; \operatorname{diag}\!\big(\sigma_\psi^2(h_t)\big)\right), \qquad \mu_\psi(h_t),\, \sigma_\psi(h_t) \in \mathbb{R}^{H_p \times N \times p}.
+$$
 
-Let the diffusion schedule be:
+## 4.1 Explicit Architectural Role and Covariance Scope
 
-\[
-\beta_1,\beta_2,\ldots,\beta_K,
-\]
+This baseline prior is a **conditionally factorized Gaussian**: conditioned on the full market context $h_t$, it predicts marginal drift $\mu_\psi(h_t)$ and marginal scale $\sigma_\psi(h_t)$ for every coordinate while treating stochastic draws across coordinates as conditionally independent.
 
-with:
+* **Prior responsibility:** Capture context-dependent marginal location and scale shifts so the flow does not spend capacity rescaling isotropic $\mathcal{N}(0, I)$ noise.
+* **DiT responsibility:** Learn the complete joint multivariate dependence structure—cross-stock correlations, sector co-movements, skewness, volatility clustering, and fat tails.
 
-\[
-\alpha_k=1-\beta_k,
-\qquad
-\bar\alpha_k=\prod_{j=1}^{k}\alpha_j.
-\]
+**Stage 6 covariance extension:** After establishing the diagonal baseline, compare against a low-rank factor Gaussian prior $\Sigma_\psi(h_t) = D_\psi(h_t) + B_\psi(h_t)B_\psi(h_t)^\top$ with factor rank $r \in \{8, 16\}$ (capturing shared market/sector shocks before the ODE starts) and a true conditional Student-$t$ prior.
 
-The forward transition is:
+## 4.2 Dual-Head Architecture, Exact $\mathcal{N}(0, I)$ Initialization & Bounded Scales
 
-\[
-q(z_k\mid z_{k-1})
-=
-\mathcal N(\sqrt{\alpha_k}z_{k-1},\beta_k I).
-\]
-
-The closed-form noising equation is:
-
-\[
-\boxed{
-z_k=\sqrt{\bar\alpha_k}z_0
-+\sqrt{1-\bar\alpha_k}\,\eta,
-\qquad \eta\sim\mathcal N(0,I).
-}
-\]
-
-At large `k`, `z_k` is mostly noise. At the terminal step, it is approximately standard Gaussian under a sufficiently good schedule.
-
-## 5.2 Conditional DiT
-
-The DiT receives:
-
-1. Noisy future latent `z_k`.
-2. Diffusion timestep `k`.
-3. Historical market context `h_t`.
-
-Its noise-prediction output is:
-
-\[
-\hat\eta_\theta=
-\operatorname{DiT}_\theta(z_k,k,h_t).
-\]
-
-A suitable architecture can contain:
-
-- Temporal self-attention across future latent tokens.
-- Cross-stock attention across asset tokens.
-- Cross-attention to historical market representations.
-- Timestep embeddings.
-- Adaptive normalization conditioned on time and market context.
-
-The temporal and cross-asset attention structure allows the denoiser to model dependencies within a future market trajectory.
-
-## 5.3 Standard diffusion objective
-
-The epsilon-prediction loss is:
-
-\[
-\boxed{
-\mathcal L_{\mathrm{diff}}
-=
-\mathbb E_{z_0,\eta,k}
-\left[
-\|\eta-\operatorname{DiT}_\theta(z_k,k,h_t)\|_2^2
-\right].
-}
-\]
-
-An alternative is velocity prediction:
-
-\[
-v_k=\sqrt{\bar\alpha_k}\eta
--\sqrt{1-\bar\alpha_k}z_0.
-\]
-
-The DiT can predict `v_k` instead. Use one parameterization consistently in an experiment.
-
-## 5.4 Reverse diffusion
-
-At inference, initialize `z_K` and repeatedly denoise it. From the predicted noise, estimate the clean latent:
-
-\[
-\hat z_0=
-\frac{z_k-\sqrt{1-\bar\alpha_k}\hat\eta_\theta}
-{\sqrt{\bar\alpha_k}}.
-\]
-
-For a deterministic DDIM-style update:
-
-\[
-\boxed{
-z_{k-1}=
-\sqrt{\bar\alpha_{k-1}}\hat z_0
-+
-\sqrt{1-\bar\alpha_{k-1}}\hat\eta_\theta.
-}
-\]
-
-Repeat until the clean future latent has been obtained.
-
-The number of sampling steps can be smaller than the training diffusion-step count if the selected sampler and timestep schedule support it.
-
-## 5.5 Important distribution-matching caveat
-
-A standard DiT trained with a Gaussian terminal distribution learns a reverse process whose initialization is matched to that training setup. Replacing the terminal Gaussian with a substantially different learned distribution is not automatically valid.
-
-The proposed generator fine-tuning phase is intended to adapt the reverse process to samples from the new prior. However, this is a research hypothesis, not a mathematical guarantee. The generator must be evaluated on samples from both the old and new prior distributions, and the standard diffusion loss should remain active as an anchor.
-
-A useful initial control is to restrict each prior update using a KL trust region and expose the generator to a mixture of old and new prior samples during its adaptation block.
-
----
-
-# 6. Conditional terminal-noise prior
-
-This is the main adaptive component of the proposed architecture.
-
-## 6.1 Standard initialization
-
-A conventional diffusion sampler begins from:
-
-\[
-z_K\sim\mathcal N(0,I).
-\]
-
-The proposed model learns a context-dependent terminal prior:
-
-\[
-\boxed{z_K\sim P_\psi(z_K\mid h_t).}
-\]
-
-The motivation is to learn a different initial-noise distribution for different historical market contexts, based on which initial samples have generated better future trajectories during training.
-
-This is not a claim that every context necessarily needs a different prior. The adaptive prior must demonstrate out-of-sample benefit over the fixed Gaussian baseline.
-
-## 6.2 Conditional diagonal Gaussian
-
-For the first implementation, parameterize:
-
-\[
-P_\psi(z_K\mid h_t)
-=
-\mathcal N\left(
-\mu_\psi(h_t),
-\operatorname{diag}(\sigma_\psi^2(h_t))
-\right).
-\]
-
-The prior network outputs a mean and scale:
-
-\[
-\mu_\psi(h_t),\qquad
-\sigma_\psi(h_t)=\operatorname{softplus}(s_\psi(h_t))+\epsilon.
-\]
-
-Apply practical lower and upper bounds to the standard deviations. Initialize the final layers so that:
-
-\[
-\mu_\psi(h_t)\approx0,
-\qquad
-\sigma_\psi(h_t)\approx1.
-\]
-
-This makes the initial prior approximately standard Gaussian.
-
-## 6.3 Reparameterized sampling
-
-Sample using:
-
-\[
-\boxed{
-z_K=\mu_\psi(h_t)
-+\sigma_\psi(h_t)\odot\xi,
-\qquad \xi\sim\mathcal N(0,I).
-}
-\]
-
-This is differentiable with respect to the prior parameters and is also useful for pathwise-gradient experiments.
-
-## 6.4 More expressive alternatives
-
-A diagonal Gaussian assumes conditional independence among terminal-latent dimensions. It is a good starting point but may be restrictive.
-
-Possible later alternatives:
-
-- Low-rank covariance Gaussian.
-- Autoregressive Gaussian prior.
-- Conditional normalizing flow.
-- Transformer-based conditional latent prior.
-
-Start with the diagonal Gaussian. Increase prior expressiveness only after establishing that terminal-prior adaptation itself improves the results.
-
----
-
-# 7. Candidate generation, reward evaluation, and elite selection
-
-For a historical context `h_t`, draw `M` candidate terminal latents:
-
-\[
-z_{K,t}^{(i)}\sim P_\psi(\cdot\mid h_t),
-\qquad i=1,\ldots,M.
-\]
-
-Generate trajectories:
-
-\[
-\hat Y_t^{(i)}=G_\theta(z_{K,t}^{(i)},h_t),
-\]
-
-where `G_θ` includes the complete reverse DiT process and the future trajectory decoder.
-
-During training, the realized subsequent trajectory `Y_t` is known and can be used to score these candidates.
-
-## 7.1 Candidate RMSE
-
-For candidate `i`:
-
-\[
-\boxed{
-d_{t,i}^{\mathrm{RMSE}}
-=
-\sqrt{
-\frac{1}{HNF_y}
-\sum_{h=1}^{H}\sum_{j=1}^{N}\sum_{f=1}^{F_y}
-(\hat Y_{t,h,j,f}^{(i)}-Y_{t,h,j,f})^2}.
-}
-\]
-
-Use normalized returns or appropriately scaled targets. Do not calculate error on raw prices without accounting for asset-specific scales.
-
-A simple candidate reward is:
-
-\[
-R_{t,i}^{\mathrm{RMSE}}=-d_{t,i}^{\mathrm{RMSE}}.
-\]
-
-## 7.2 Elite selection
-
-The recommended initial approach is top-`K_e` selection:
-
-\[
-\mathcal E_t=
-\operatorname{TopK}_{i}
-\left(-d_{t,i}^{\mathrm{RMSE}}\right).
-\]
-
-For an initial experiment, generate around 20 candidates and retain 4–5 elites. These are tunable experimental values.
-
-A threshold rule is also possible:
-
-\[
-\mathcal E_t=
-\{i:d_{t,i}^{\mathrm{RMSE}}\leq\tau_t\}.
-\]
-
-However, a fixed threshold may select no candidates in a difficult period or almost every candidate in an easy period. Top-`K_e` selection provides a predictable elite count.
-
-## 7.3 Sample-level statistical rewards
-
-RMSE can be supplemented with financial-statistics losses.
-
-### Volatility mismatch
-
-For asset `j`, let `v_j(Y)` denote the volatility calculated over the target horizon. Then:
-
-\[
-\mathcal L_{\mathrm{vol}}^{(i)}
-=
-\frac1N\sum_{j=1}^{N}
-\left(v_j(\hat Y^{(i)})-v_j(Y)\right)^2.
-\]
-
-### Cross-stock correlation mismatch
-
-Let `C(Y)` be a correlation matrix estimated from the future trajectory:
-
-\[
-\mathcal L_{\mathrm{corr}}^{(i)}
-=
-\frac{1}{N^2}
-\|C(\hat Y^{(i)})-C(Y)\|_F^2.
-\]
-
-Short horizons can produce noisy correlation estimates. Consider shrinkage covariance or sector-level summaries.
-
-### Temporal autocorrelation mismatch
-
-Let `a_{j,\ell}(Y)` be the autocorrelation for asset `j` at lag `ℓ`. Then:
-
-\[
-\mathcal L_{\mathrm{ACF}}^{(i)}
-=
-\frac{1}{NJ}
-\sum_{j=1}^{N}\sum_{\ell=1}^{J}
-\left(a_{j,\ell}(\hat Y^{(i)})-a_{j,\ell}(Y)\right)^2.
-\]
-
-A sample-level reward can be:
-
-\[
-\boxed{
-R_{t,i}=
--\lambda_r\mathcal L_{\mathrm{RMSE}}^{(i)}
--\lambda_v\mathcal L_{\mathrm{vol}}^{(i)}
--\lambda_c\mathcal L_{\mathrm{corr}}^{(i)}
--\lambda_a\mathcal L_{\mathrm{ACF}}^{(i)}.
-}
-\]
-
-Normalize loss components before combining them. Begin with RMSE alone, then introduce other terms through controlled experiments.
-
-## 7.4 Ensemble-level scoring rules
-
-Some metrics assess a set of generated trajectories, not one trajectory in isolation.
-
-### Energy Score
-
-For `M` generated samples:
-
-\[
-\boxed{
-ES=
-\frac1M\sum_{i=1}^{M}\|\hat Y^{(i)}-Y\|
--
-\frac{1}{2M^2}
-\sum_{i=1}^{M}\sum_{j=1}^{M}
-\|\hat Y^{(i)}-\hat Y^{(j)}\|.
-}
-\]
-
-Lower is better. The first term measures closeness to the observation; the second rewards an appropriately dispersed ensemble.
-
-### Variogram Score
-
-For coordinates `a,b` indexing time–asset pairs:
-
-\[
-\boxed{
-VS_p=
-\sum_{a,b}w_{ab}
-\left[
-|Y_a-Y_b|^p
--
-\mathbb E_{\hat Y}|\hat Y_a-\hat Y_b|^p
-\right]^2.
-}
-\]
-
-The expectation is estimated using the generated ensemble. This score assesses dependence structure across components of the multivariate trajectory.
-
-Calculate Energy Score and Variogram Score across the candidate ensemble or a minibatch of ensemble samples. Do not incorrectly treat them as independent per-candidate rewards without defining the corresponding ensemble objective.
-
-## 7.5 Diversity and oracle-selection caution
-
-Selecting the lowest-RMSE samples is useful during training because the future is available as a training target. It can nevertheless cause the learned prior to concentrate around a narrow set of latent regions.
-
-Mitigate this using:
-
-- KL regularization against the previous prior.
-- A variance floor for the conditional prior.
-- Reward temperature rather than only hard selection.
-- Distribution-level scoring rules.
-- Fresh samples across training updates.
-- Validation on complete ensembles without ground-truth candidate selection.
-
-Do not report the best-of-`M` RMSE as the primary inference metric. At inference the future is unknown, so the model cannot select the sample that happens to be closest to it. Report ensemble mean/median point forecasts and proper probabilistic scores instead.
-
----
-
-# 8. Prior optimization block: moving reference and trust region
-
-This is the first half of the alternating training scheme.
-
-The prior is optimized while the generator is held fixed. The reference prior is also held fixed throughout the block.
-
-## 8.1 Outer iteration snapshots
-
-Let `b` denote the outer iteration.
-
-At its beginning, create detached snapshots:
-
-\[
-P_{\mathrm{ref}}^{(b)}
-=P_{\bar\psi^{(b)}},
-\]
-
-and:
-
-\[
-G_{\mathrm{ref}}^{(b)}
-=G_{\bar\theta^{(b)}}.
-\]
-
-These references are constant during their respective block. The online prior is initialized from the previous learned prior and is trainable.
-
-## 8.2 Candidate generation under a frozen generator
-
-For a batch of historical contexts:
-
-\[
-z_{K,t}^{(i)}\sim P_\psi(\cdot\mid h_t).
-\]
-
-Generate candidates using the frozen EMA generator:
-
-\[
-\hat Y_t^{(i)}=G_{\bar\theta^{(b)}}(z_{K,t}^{(i)},h_t).
-\]
-
-Evaluate rewards, select elite samples, and retain the original initial latents associated with them.
-
-The generator is frozen because the goal of this block is to identify useful terminal-latent regions under a fixed mapping.
-
-Fresh candidate samples should be generated as the prior updates. Repeatedly fitting only to one fixed set of elite latent vectors risks over-concentration and sample memorization.
-
-## 8.3 Reward-weighted likelihood update
-
-For selected elites `i ∈ E_t`, define softmax weights:
-
-\[
-\boxed{
-w_{t,i}=
-\frac{\exp(R_{t,i}/T)}
-{\sum_{j\in\mathcal E_t}\exp(R_{t,j}/T)}.
-}
-\]
-
-Here `T` is a temperature. Smaller values focus more strongly on the highest-reward candidates; larger values distribute weight more evenly.
-
-The elite negative log-likelihood is:
-
-\[
-\mathcal L_{\mathrm{elite-prior}}
-=-\frac1B\sum_{t=1}^{B}
-\sum_{i\in\mathcal E_t}
- w_{t,i}\log P_\psi(z_{K,t}^{(i)}\mid h_t).
-\]
-
-This update makes the new prior assign higher likelihood to initial latents that generated better trajectories.
-
-## 8.4 Moving-reference KL regularizer
-
-The prior should not be permanently constrained to the original Gaussian. Instead, it should move progressively from the previous learned prior.
-
-During outer iteration `b`, the reference is:
-
-\[
-P_{\mathrm{ref}}^{(b)}=P_{\bar\psi^{(b)}}.
-\]
-
-The conditional KL loss is:
-
-\[
-\mathcal L_{\mathrm{KL-prior}}
-=
-\frac1B\sum_{t=1}^{B}
-D_{KL}\left(
-P_\psi(\cdot\mid h_t)
-\Vert
-P_{\mathrm{ref}}^{(b)}(\cdot\mid h_t)
-\right).
-\]
-
-The direction `D_KL(new || reference)` penalizes the new prior for assigning probability mass far outside regions supported by the previous prior.
-
-For diagonal Gaussians:
-
-\[
-P_\psi=\mathcal N(\mu_\psi,\operatorname{diag}(\sigma_\psi^2)),
-\]
-
-\[
-P_{\mathrm{ref}}=\mathcal N(\mu_{\mathrm{ref}},\operatorname{diag}(\sigma_{\mathrm{ref}}^2)),
-\]
-
-the KL divergence is:
-
-\[
-\boxed{
-D_{KL}(P_\psi\Vert P_{\mathrm{ref}})
-=
-\frac12\sum_j\left[
-\log\frac{\sigma_{\mathrm{ref},j}^2}{\sigma_{\psi,j}^2}
-+
-\frac{\sigma_{\psi,j}^2+(\mu_{\psi,j}-\mu_{\mathrm{ref},j})^2}
-{\sigma_{\mathrm{ref},j}^2}
--1
-\right].
-}
-\]
-
-The reference parameters are detached and fixed throughout the prior block.
-
-## 8.5 Trust-region constraint
-
-The average conditional KL can be constrained:
-
-\[
-\boxed{
-\frac1B\sum_{t=1}^{B}
-D_{KL}(P_\psi(\cdot\mid h_t)\Vert P_{\mathrm{ref}}^{(b)}(\cdot\mid h_t))
-\leq\delta.
-}
-\]
-
-A Lagrangian penalty can be used:
-
-\[
-\mathcal L_{P}
-=
-\mathcal L_{\mathrm{elite-prior}}
-+
-\beta_b(\overline D_{KL}-\delta)
-+
-\gamma_{\mathrm{var}}\mathcal L_{\mathrm{var}}.
-\]
-
-An adaptive multiplier may be updated as:
-
-\[
-\boxed{
-\beta_b\leftarrow
-\beta_b\exp\left[\eta_\beta(\overline D_{KL}-\delta)\right].
-}
-\]
-
-If observed KL is above the desired budget, the coefficient increases; if it is below the budget, it decreases. In practice, clamp the multiplier to a reasonable range and update it at a slower frequency than the optimizer.
-
-The variance regularizer and explicit scale bounds prevent the prior from collapsing to extremely small variance:
-
-\[
-\sigma_{\min}\leq\sigma_\psi(h_t)\leq\sigma_{\max}.
-\]
-
-## 8.6 Complete prior objective
-
-The complete prior loss is:
-
-\[
-\boxed{
-\begin{aligned}
-\mathcal L_{\mathrm{prior}}^{(b)}
-={}&-
-\frac1B\sum_{t=1}^{B}
-\sum_{i\in\mathcal E_t}
- w_{t,i}\log P_\psi(z_{K,t}^{(i)}\mid h_t)
-\\
-&+\beta_b\frac1B\sum_{t=1}^{B}
-D_{KL}\left(
-P_\psi(\cdot\mid h_t)\Vert P_{\mathrm{ref}}^{(b)}(\cdot\mid h_t)
-\right)
-\\
-&+\gamma_{\mathrm{var}}\mathcal L_{\mathrm{var}}.
-\end{aligned}
-}
-\]
-
-Only the online prior parameters `ψ` are optimized in this block.
-
-## 8.7 CEM-style update versus formal policy-gradient RL
-
-The weighted elite maximum-likelihood objective is a CEM-style reward-guided distribution update. It should not be described as a conventional multi-step RL algorithm by itself.
-
-A formal contextual policy-gradient version is also possible. Treat `z_K` as an action sampled from policy `P_ψ(·|h_t)`, with the historical representation as the context and the generated trajectory reward as the outcome:
-
-\[
-J(\psi)=
-\mathbb E_{z_K\sim P_\psi(\cdot\mid h_t)}[R(G_\theta(z_K,h_t),Y_t)]
--
-\beta D_{KL}(P_\psi\Vert P_{\mathrm{ref}}).
-\]
-
-The score-function gradient is:
-
-\[
-\boxed{
-\nabla_\psi J=
-\mathbb E\left[
-(R-b(h_t))\nabla_\psi\log P_\psi(z_K\mid h_t)
-\right]
--
-\beta\nabla_\psi D_{KL}.
-}
-\]
-
-`b(h_t)` is a baseline for variance reduction. This is more accurately a contextual-bandit or one-step policy-optimization problem than a long-horizon RL problem, because the policy chooses the initial latent and receives a terminal trajectory reward.
-
-Implement elite-weighted likelihood first, then compare it with policy gradients as a separate experiment.
-
----
-
-# 9. Generator optimization block
-
-After the prior block, the online prior has adapted. Update its EMA copy and construct a fixed sampling distribution for generator training.
-
-The generator is now trainable, while the prior distributions are frozen.
-
-## 9.1 Old and new prior snapshots
-
-At the beginning of outer iteration `b`, the old prior reference is:
-
-\[
-P_{\mathrm{old}}^{(b)}=P_{\bar\psi^{(b)}}.
-\]
-
-After prior optimization and its EMA update, the new prior is:
-
-\[
-P_{\mathrm{new}}^{(b)}=P_{\bar\psi^{(b+1)}}.
-\]
-
-Both distributions are detached and fixed during the generator block.
-
-## 9.2 Fixed mixture for generator training
-
-Use:
-
-\[
-\boxed{
-q_b(z_K\mid h_t)
-=
-\rho P_{\mathrm{new}}^{(b)}(z_K\mid h_t)
-+(1-\rho)P_{\mathrm{old}}^{(b)}(z_K\mid h_t).
-}
-\]
-
-This gives the generator exposure to both:
-
-- Latent regions found useful under the previous generator.
-- Newly discovered latent regions from the adapted prior.
-
-The mixture weights and component distributions stay fixed for the entire generator optimization block. New samples can be drawn for each minibatch from this same fixed mixture.
-
-An optional small Gaussian anchor can be added:
-
-\[
-q_b=
-\rho P_{\mathrm{new}}^{(b)}
-+(1-\rho-\kappa)P_{\mathrm{old}}^{(b)}
-+\kappa\mathcal N(0,I),
-\]
-
-where `κ` is small and may be annealed. This is an ablation, not a mandatory permanent component.
-
-## 9.3 Generator parameters and gradient path
-
-Let the complete generator be:
-
-\[
-G_\theta=D_\omega\circ R_{\theta_D},
-\]
-
-where `R_{θ_D}` is the reverse DiT process and `D_ω` is the trajectory decoder. The trainable generator parameters are:
-
-\[
-\theta=(\theta_D,\omega).
-\]
-
-For generator fine-tuning, the reward gradient flows through:
-
-\[
-z_K
-\rightarrow R_{\theta_D}
-\rightarrow z_0
-\rightarrow D_\omega
-\rightarrow \hat Y
-\rightarrow \mathcal L.
-\]
-
-The prior is frozen, so no prior parameter update takes place in this block.
-
-## 9.4 Diffusion preservation loss
-
-Keep the standard denoising objective active:
-
-\[
-\mathcal L_{\mathrm{diff}}
-=
-\mathbb E_{z_0,\eta,k}
-\left[
-\|\eta-\operatorname{DiT}_\theta(z_k,k,h_t)\|_2^2
-\right].
-\]
-
-This anchors the denoiser to the original forward-diffusion learning problem and reduces the risk that reward fine-tuning destroys its learned denoising behaviour.
-
-## 9.5 Decoder reconstruction loss
-
-Retain the future autoencoder reconstruction objective:
-
-\[
-\boxed{
-\mathcal L_{\mathrm{recon}}
-=
-\frac1B\sum_{t=1}^{B}
-\|Y_t-D_\omega(E_\chi(Y_t,h_t),h_t)\|_2^2.
-}
-\]
-
-The future encoder `E_χ` is frozen, while the decoder `D_ω` is trainable. This lets the decoder improve while retaining its ability to reconstruct actual future trajectories from the established latent coordinate system.
-
-## 9.6 Elite reward loss
-
-Draw candidates from the fixed mixture:
-
-\[
-z_{K,t}^{(i)}\sim q_b(\cdot\mid h_t),
-\]
-
-and generate:
-
-\[
-\hat Y_t^{(i)}=G_\theta(z_{K,t}^{(i)},h_t).
-\]
-
-Select elite samples and define:
-
-\[
-\boxed{
-\mathcal L_{\mathrm{elite}}
-=
-\frac1B\sum_{t=1}^{B}
-\sum_{i\in\mathcal E_t}
- w_{t,i}
-\|\hat Y_t^{(i)}-Y_t\|_2^2.
-}
-\]
-
-The elite-index selection is discrete. Gradients are nevertheless available through the generated trajectories of the selected candidates. The selection step itself is not differentiated.
-
-For differentiable reward optimization, a deterministic DDIM-style sampler is a useful initial choice because it makes the reverse path easier to differentiate and reduces sampling variance. Stochastic sampling can still be used for evaluation and inference.
-
-## 9.7 Distribution-level generator losses
-
-Calculate Energy Score and Variogram Score over the complete candidate ensemble:
-
-\[
-\mathcal L_{\mathrm{distribution}}
-=
-\lambda_{ES}\mathcal L_{ES}
-+
-\lambda_{VS}\mathcal L_{VS}.
-\]
-
-These objectives help prevent the generator from focusing exclusively on one realized future and losing uncertainty or cross-asset dependence information.
-
-They should be evaluated over all candidates (or a suitably sized ensemble), not merely the elite subset.
-
-## 9.8 Complete generator objective
-
-The proposed loss is:
-
-\[
-\boxed{
-\begin{aligned}
-\mathcal L_{\mathrm{generator}}
-={}&
-\lambda_{\mathrm{diff}}\mathcal L_{\mathrm{diff}}
-+
-\lambda_{\mathrm{recon}}\mathcal L_{\mathrm{recon}}
-\\
-&+
-\lambda_{\mathrm{elite}}\mathcal L_{\mathrm{elite}}
-+
-\lambda_{ES}\mathcal L_{ES}
-+
-\lambda_{VS}\mathcal L_{VS}.
-\end{aligned}
-}
-\]
-
-The generator update is:
-
-\[
-\boxed{
-\theta^{(b+1)}
-=
-\arg\min_\theta
-\mathcal L_{\mathrm{generator}}(\theta;q_b).
-}
-\]
-
-During this optimization, `q_b` remains fixed.
-
-## 9.9 Training-batch composition
-
-The generator block can use two complementary sources of training signal:
-
-1. **Forward diffusion batches:** construct noised latent targets from actual future encodings and train the DiT with the standard diffusion loss.
-2. **Reverse-generation batches:** sample terminal latents from `q_b`, run the reverse sampler, decode candidates, and calculate elite and ensemble reward losses.
-
-These may be calculated in the same training step or on separate minibatches. In either case, keep their relative loss weights controlled and monitor the standard diffusion loss so the generator does not forget the original denoising task.
-
----
-
-# 10. Alternating optimization, EMA, and snapshots
-
-This section specifies how the two blocks interact over outer iterations.
-
-## 10.1 Four parameter sets
-
-Maintain:
-
-| Parameters | Role |
-|---|---|
-| `ψ` | Online trainable terminal prior |
-| `\bar ψ` | EMA terminal prior |
-| `θ` | Online trainable DiT + trajectory decoder |
-| `\bar θ` | EMA DiT + trajectory decoder |
-
-The historical encoder and future encoder are frozen during the first reward-adaptation experiments.
-
-## 10.2 EMA updates
-
-Prior EMA:
-
-\[
-\boxed{
-\bar\psi\leftarrow
-\alpha_P\bar\psi+(1-\alpha_P)\psi.
-}
-\]
-
-Generator EMA:
-
-\[
-\boxed{
-\bar\theta\leftarrow
-\alpha_G\bar\theta+(1-\alpha_G)\theta.
-}
-\]
-
-Initial experimental values might be:
-
-\[
-\alpha_P=0.995,
-\qquad
-\alpha_G=0.999.
-\]
-
-These are starting values, not universal settings. Tune them using validation quality and stability diagnostics.
-
-EMA copies are detached moving averages. They are not ordinarily trained by backpropagation. Use online weights for gradient updates and EMA weights for stable reference sampling and validation.
-
-## 10.3 Outer iteration schedule
-
-At the start of outer iteration `b`, snapshot:
-
-\[
-P_{\mathrm{ref}}^{(b)}=P_{\bar\psi^{(b)}},
-\qquad
-G_{\mathrm{ref}}^{(b)}=G_{\bar\theta^{(b)}}.
-\]
-
-### Block A: prior optimization
-
-- Freeze `G_ref^(b)`.
-- Freeze `P_ref^(b)` as the KL reference.
-- Train online prior `ψ`.
-- Sample candidates from the current online prior.
-- Evaluate them with the frozen EMA generator.
-- Select elites and optimize the prior objective.
-- Update the online prior EMA during the block, but do not change the fixed reference snapshot.
-
-At the end of the block, obtain:
-
-\[
-P_{\mathrm{new}}^{(b)}=P_{\bar\psi^{(b+1)}}.
-\]
-
-### Block B: generator optimization
-
-Construct:
-
-\[
-q_b=
-\rho P_{\mathrm{new}}^{(b)}
-+(1-\rho)P_{\mathrm{old}}^{(b)}.
-\]
-
-- Freeze both prior snapshots.
-- Freeze the historical encoder and future encoder initially.
-- Train the online DiT and trajectory decoder.
-- Keep the standard diffusion and reconstruction objectives active.
-- Add reward-based elite and ensemble losses.
-- Update the generator EMA during the block.
-
-At the end of the block, start the next outer iteration with refreshed snapshots.
-
-## 10.4 Why this is more controlled than simultaneous updates
-
-With simultaneous updates, the prior can change the input distribution while the generator is adapting to the previous distribution. The generator can therefore chase a moving input distribution, while the prior is being evaluated using a moving generator.
-
-Alternating optimization gives each component a block in which the other component's relevant reference is fixed:
-
-- The prior learns useful terminal-latent regions under a fixed generator.
-- The generator learns to map samples from a fixed mixture of old and new priors into better trajectories.
-
-This does not guarantee global convergence. The joint problem remains non-convex. It is a controlled optimization strategy that should be compared empirically with simultaneous updates.
-
----
-
-# 11. Full training algorithm
-
-## 11.1 Pretraining
-
-1. Prepare the chronological financial dataset.
-2. Train the historical market encoder.
-3. Train the future trajectory VAE.
-4. Freeze the future trajectory encoder.
-5. Train the conditional latent DiT using a standard Gaussian terminal distribution and the diffusion objective.
-6. Initialize the conditional terminal prior to approximately standard Gaussian.
-7. Initialize separate EMA copies of the prior and generator.
-
-## 11.2 Alternating reward-guided training pseudocode
+Condition each stock token $h_{t,i}^{\text{stocks}}$ on $h_t^{\text{global}}$ via FiLM/AdaLN and pass through a shared lightweight per-stock MLP trunk producing hidden features $f_{t,i} \in \mathbb{R}^{d_{\text{prior}}}$. Use **two separate linear output heads** per stock:
 
 ```python
-# Conceptual pseudocode. Helper functions require implementation.
+self.mu_head = nn.Linear(d_prior, H_p * p)
+self.scale_head = nn.Linear(d_prior, H_p * p)
 
-initialize_market_encoder()
-initialize_future_trajectory_vae()
-initialize_conditional_dit()
+b0 = math.log((1.0 - sigma_min) / (sigma_max - 1.0))  # ~ -1.3218 for (0.20, 4.00)
 
-freeze(future_trajectory_encoder)
-initialize_conditional_prior_as_standard_gaussian()
+nn.init.zeros_(self.mu_head.weight)
+nn.init.zeros_(self.mu_head.bias)
 
-initialize_ema_prior()
-initialize_ema_generator()
-
-for outer_step in range(num_outer_steps):
-
-    # --------------------------------------------------
-    # Freeze snapshots at the beginning of the outer step
-    # --------------------------------------------------
-    prior_reference = frozen_copy(ema_prior)
-    generator_reference = frozen_copy(ema_generator)
-
-    # ==================================================
-    # BLOCK A: PRIOR OPTIMIZATION
-    # ==================================================
-    freeze(generator_reference)
-    freeze(prior_reference)
-    train(online_prior)
-
-    for epoch in range(prior_epochs):
-        for past_data, future_truth in train_loader:
-
-            context = market_encoder(past_data)
-
-            # Draw fresh candidates from current online prior
-            terminal_latents = online_prior.sample(
-                context,
-                num_samples=num_candidates
-            )
-
-            # Generator is frozen during this block
-            with no_grad():
-                candidates = generator_reference.generate(
-                    terminal_latents, context
-                )
-
-            candidate_rmse = evaluate_rmse(candidates, future_truth)
-            elite_indices = select_top_k(candidate_rmse, num_elites)
-
-            elite_latents = terminal_latents[elite_indices]
-            elite_rewards = -candidate_rmse[elite_indices]
-            elite_weights = softmax(elite_rewards / temperature)
-
-            elite_nll = weighted_negative_log_likelihood(
-                online_prior,
-                elite_latents,
-                context,
-                elite_weights
-            )
-
-            moving_kl = conditional_kl(
-                online_prior,
-                prior_reference,
-                context
-            )
-
-            variance_penalty = prior_variance_regularization(online_prior)
-
-            prior_loss = (
-                elite_nll
-                + beta * (moving_kl - kl_target)
-                + gamma_var * variance_penalty
-            )
-
-            prior_optimizer.zero_grad()
-            prior_loss.backward()
-            clip_grad_norm_(online_prior.parameters())
-            prior_optimizer.step()
-
-            update_ema_prior()
-            adapt_kl_multiplier_if_needed()
-
-    # Snapshot the newly adapted prior after the prior block
-    new_prior = frozen_copy(ema_prior)
-
-    # ==================================================
-    # BLOCK B: GENERATOR OPTIMIZATION
-    # ==================================================
-    freeze(prior_reference)
-    freeze(new_prior)
-    freeze(market_encoder)
-    freeze(future_trajectory_encoder)
-
-    train(online_dit)
-    train(online_trajectory_decoder)
-
-    # Fixed for the entire generator block
-    sampling_distribution = fixed_mixture(
-        new_prior,
-        prior_reference,
-        new_prior_weight=rho
-    )
-
-    for epoch in range(generator_epochs):
-        for past_data, future_truth in train_loader:
-
-            context = market_encoder(past_data)
-
-            # Forward-diffusion denoising batch
-            diffusion_loss = compute_diffusion_loss(
-                online_dit,
-                future_trajectory_encoder,
-                future_truth,
-                context
-            )
-
-            # Reverse-generation batch from fixed prior mixture
-            terminal_latents = sampling_distribution.sample(
-                context,
-                num_samples=num_candidates
-            )
-
-            generated = online_generator.generate(
-                terminal_latents,
-                context
-            )
-
-            candidate_rmse = evaluate_rmse(generated, future_truth)
-            elite_indices = select_top_k(candidate_rmse, num_elites)
-
-            reconstruction_loss = compute_autoencoder_reconstruction_loss(
-                online_trajectory_decoder,
-                future_trajectory_encoder,
-                future_truth,
-                context
-            )
-
-            elite_loss = compute_weighted_elite_loss(
-                generated,
-                future_truth,
-                elite_indices
-            )
-
-            energy_loss = compute_energy_score(generated, future_truth)
-            variogram_loss = compute_variogram_score(generated, future_truth)
-
-            generator_loss = (
-                lambda_diff * diffusion_loss
-                + lambda_recon * reconstruction_loss
-                + lambda_elite * elite_loss
-                + lambda_energy * energy_loss
-                + lambda_variogram * variogram_loss
-            )
-
-            generator_optimizer.zero_grad()
-            generator_loss.backward()
-            clip_grad_norm_(online_generator.parameters())
-            generator_optimizer.step()
-
-            update_ema_generator()
-
-    # ==================================================
-    # VALIDATION AND CHECKPOINTING
-    # ==================================================
-    validate_without_oracle_candidate_selection()
-    log_prior_kl_and_entropy()
-    log_ensemble_diversity()
-    log_online_and_ema_metrics()
-    save_checkpoint_if_validation_improves()
+nn.init.zeros_(self.scale_head.weight)
+nn.init.constant_(self.scale_head.bias, b0)
 ```
 
-This is conceptual pseudocode, not a drop-in implementation. In particular, a production implementation must carefully handle reverse-sampler differentiability, batch and candidate dimensions, mixed precision, memory usage, and separate optimizer parameter groups.
+Reshape across stocks into $\mu_\psi(h_t), s_\psi(h_t) \in \mathbb{R}^{H_p \times N \times p}$ and enforce strict positive bounds analytically by construction:
+
+$$
+\sigma_\psi(h_t) = \sigma_{\min} + (\sigma_{\max} - \sigma_{\min}) \cdot \operatorname{sigmoid}\!\big(s_\psi(h_t)\big),
+$$
+
+with default bounds $\sigma_{\min} = 0.20$ and $\sigma_{\max} = 4.00$. At initialization, $\mu_\psi(h_t) \equiv 0$ and $\sigma_\psi(h_t) \equiv 1$ identically ($\mathcal{N}(0, I)$).
+
+**Boundary-saturation diagnostic:** Continuously log the fraction of coordinates with $\sigma_{\psi, d} < \sigma_{\min} + 0.02$ or $\sigma_{\psi, d} > \sigma_{\max} - 0.05$. If saturation exceeds $5\%$ on validation, widen bounds or evaluate a heavy-tailed prior family.
+
+## 4.3 Strict Gradient-Ownership Rules for Sampling
+
+Reparameterized sampling is $\xi_0 = \mu_\psi(h_t) + \sigma_\psi(h_t) \odot \epsilon$, $\epsilon \sim \mathcal{N}(0, I)$:
+
+* **Pathwise distributional transport ($\mathcal{L}_{\text{SD}}$ or $\mathcal{L}_{\text{SW2}}$):** Use attached `rsample` so gradients flow through $\xi_0$ into $(\mu_\psi, \sigma_\psi)$.
+* **Straightness policy gradient ($\mathcal{L}_{\text{straight-PG}}$):** Explicitly **detach** $\xi_0$ (`xi_0.detach()`) before evaluating `log_prob_sum` to prevent Gaussian score cancellation.
+* **Generator Block B:** Sample from frozen prior snapshots under `torch.no_grad()` / `.detach()`.
 
 ---
 
-# 12. Inference procedure
+# 5. Direct Patched Conditional Flow Matching DiT ($v_\theta$)
 
-At inference, the subsequent ground-truth trajectory is unknown. Therefore, no reward evaluation, RMSE-based selection, or prior update takes place.
+## 5.1 Tokenization and Full Spatiotemporal DiT Backbone
 
-Use the final EMA models.
+Given an interpolated patched return tensor $z_\tau \in \mathbb{R}^{H_p \times N \times p}$, continuous flow time $\tau \in [0, 1]$, and context $h_t$:
 
-## Step 1: Encode recent market history
+1. **Patch input projection:** Project each $p$-day return patch $x_{k,i} \in \mathbb{R}^p$ into internal Transformer width $d_{\text{model}} = 128$:
 
-\[
-h_t=E_\phi(X_t^{\mathrm{past}}).
-\]
+$$
+e_{k,i}^{(0)} = W_{\text{in}} x_{k,i} + b_{\text{in}} + e_k^{\text{patch}} + e_i^{\text{stock}} + e_{\text{sec}(i)}^{\text{sector}} \in \mathbb{R}^{d_{\text{model}}}.
+$$
 
-## Step 2: Sample terminal latents from the learned prior
+Flatten across $(H_p, N)$ into a sequence of $T_{\text{tok}} = H_p N$ tokens ($250$ tokens for $p = 4$).
 
-\[
-z_K^{(i)}\sim P_{\bar\psi}(z_K\mid h_t),
-\qquad i=1,\ldots,M.
-\]
+2. **DiT blocks ($L_{\text{DiT}} = 6\text{--}8$ layers):** Each block applies **full joint 2D spatiotemporal self-attention**, cross-attention to $h_t^{\text{stocks}} \in \mathbb{R}^{N \times d_h}$, and a SwiGLU FFN. All sublayers are modulated by **AdaLN-Zero** conditioned on $c_\tau = \operatorname{MLP}(\operatorname{SinusoidalEmb}(\tau)) + \operatorname{Proj}(h_t^{\text{global}})$.
+3. **Output velocity projection:** Apply final AdaLN and a zero-initialized linear head $W_{\text{out}} \in \mathbb{R}^{p \times d_{\text{model}}}$, reshaping back to:
 
-## Step 3: Run reverse diffusion
+$$
+v_\theta(z_\tau, \tau, h_t) \in \mathbb{R}^{H_p \times N \times p}.
+$$
 
-\[
-z_0^{(i)}=R_{\bar\theta_D}(z_K^{(i)},h_t).
-\]
+## 5.2 Linear Probability Path, Flow-Time Sampling & Canonical MSE Objective
 
-## Step 4: Decode future trajectories
+For a paired source sample $\xi_0$ and patched target $Y_t^{\text{patch}}$:
 
-\[
-\boxed{
-\hat Y_t^{(i)}=D_{\bar\omega}(z_0^{(i)},h_t).
-}
-\]
+$$
+z_\tau = (1 - \tau)\xi_0 + \tau Y_t^{\text{patch}}, \qquad u^* = \frac{dz_\tau}{d\tau} = Y_t^{\text{patch}} - \xi_0, \qquad \tau \in [0, 1].
+$$
 
-## Step 5: Convert normalized returns into prices
+* **Canonical flow-time distribution:** $\tau \sim \mathcal{U}(0, 1)$ (Logit-Normal $\tau = \operatorname{sigmoid}(s),\, s \sim \mathcal{N}(0, 1)$ isolated in Exp M2).
+* **Canonical CFM objective (MSE):**
 
-If the model predicts normalized log returns:
+$$
+\mathcal{L}_{\text{CFM}}^{(b)} = \mathbb{E}_{(\xi_0, Y^{\text{patch}}, h_j) \sim \pi_b,\; \tau \sim p_\tau}\!\left[\frac{1}{D}\left\|v_\theta(z_\tau, \tau, h_j) - \big(Y^{\text{patch}} - \xi_0\big)\right\|_2^2\right].
+$$
 
-\[
-\hat P_{i,t+h}
-=
-P_{i,t}\exp\left(
- s_{i,t}\sum_{j=1}^{h}
- \hat{\tilde r}_{i,t+j}
-\right).
-\]
+MSE remains primary because its exact population minimizer is the conditional expectation $v^*(z_\tau, \tau, h) = \mathbb{E}[u^* \mid z_\tau, \tau, h]$. Keep Pseudo-Huber CFM and tail-weighted MSE strictly as separate ablations (Exp P).
 
-This produces an ensemble of possible price paths for the modeled stocks.
+## 5.3 Source–Target Coupling: Independent Baseline vs. KL-Constrained Local Conditional OT Approximation
 
-Possible downstream analysis includes:
+### Why Coupling Is a First-Class Component
 
-- Expected returns and median trajectories.
-- Prediction intervals and uncertainty.
-- Volatility distributions.
-- Cross-stock correlations.
-- Tail-risk scenarios.
-- Probabilities of different market states.
-- Comparisons between generated and realized market dynamics.
+Even when $P_\psi = p_{\text{data}} = \mathcal{N}(0, I)$, independent linear interpolation $z_\tau = (1 - \tau)\xi_0 + \tau Y$ yields intermediate variance $\operatorname{Var}(z_\tau) = (1 - \tau)^2 + \tau^2$, contracting to $\operatorname{Var}(z_{0.5}) = 0.5$ before re-expanding—forcing a nontrivial transport map. Optimal identity coupling ($\xi_0 = Y$) instead yields $u^* = 0$. Therefore, v4.3 elevates the comparison between **Same-Context Independent Coupling** and **KL-Constrained Local Conditional OT Approximation** into a primary study (Stage 3 & Exp L), and requires every reported transport displacement to state its exact coupling $\pi$:
 
-The learned prior is fixed during inference. It generates terminal latents conditioned on the observed historical representation.
+$$
+D_{\text{transport}}(\pi) = \mathbb{E}_{(\xi_0, Y^{\text{patch}}) \sim \pi}\!\left[\frac{1}{D}\left\|Y^{\text{patch}} - \xi_0\right\|_2^2\right].
+$$
 
----
+### KL-Constrained Local Conditional OT Approximation (Uniform Marginals + Symmetric Mask)
 
-# 13. Evaluation methodology
+Retrieve local neighborhoods $g$ of size $B_g \in \{16, 32\}$ in normalized frozen global context space $\hat{h}^{\text{global}}$ (optionally requiring matching coarse volatility regime $r_i = r_j$). Because financial history gives one realized trajectory per date, this is explicitly a **local conditional OT approximation**, not exact conditional OT.
 
-Evaluation must measure both point accuracy and the quality of the generated distribution.
+1. **Uniform Matching Marginals (Guaranteed Diagonal Feasibility):** Fix uniform source and target weights over the indexed neighborhood minibatch:
 
-## 13.1 Point forecasting accuracy
+$$
+a = b = \left[\frac{1}{B_g}, \dots, \frac{1}{B_g}\right]^\top \in \Delta^{B_g - 1}.
+$$
 
-Report:
+2. **Symmetric Convexity Upper-Bound Runtime Mask:** Because $q_b = \rho P_{\text{new}} + (1 - \rho)P_{\text{old}}$ is a Gaussian mixture with no closed-form KL, define the directional convexity upper bound:
 
-- RMSE.
-- MAE.
-- Directional accuracy.
-- Horizon-wise RMSE/MAE.
+$$
+U(i, j) = \rho\,\overline{D}_{KL}\!\big(P_{\text{new}}(\cdot \mid h_i) \Vert P_{\text{new}}(\cdot \mid h_j)\big) + (1 - \rho)\,\overline{D}_{KL}\!\big(P_{\text{old}}(\cdot \mid h_i) \Vert P_{\text{old}}(\cdot \mid h_j)\big),
+$$
 
-For an ensemble of `M` trajectories, one point forecast is the ensemble mean:
+symmetrize it for neighborhood compatibility, and construct the binary mask:
 
-\[
-\bar Y_t=\frac1M\sum_{i=1}^{M}\hat Y_t^{(i)}.
-\]
+$$
+U_{\text{sym}}(i, j) = \frac{1}{2}\big(U(i, j) + U(j, i)\big), \qquad M_{ij} = \mathbf{1}\!\left[U_{\text{sym}}(i, j) \le \delta_{\text{context}} \;\land\; r_i = r_j\right].
+$$
 
-Calculate point-forecast metrics using `\bar Y_t` or a clearly specified median forecast.
+Because $U_{\text{sym}}(i, i) = 0 \le \delta_{\text{context}}$ and $a = b = \mathbf{1}/B_g$, the diagonal plan $\Pi = \operatorname{diag}(1/B_g, \dots, 1/B_g)$ is **provably feasible** in the masked polytope.
 
-Do not report best-of-`M` RMSE as the primary forecasting result. That metric uses the realized future to select a generated trajectory and is an oracle diagnostic, not a valid inference-time forecast.
+3. **Scale-Normalized Cost Matrix & Explicitly Masked Log-Domain Sinkhorn:** Normalize both state squared distances $C_{ij}^{\text{state}} = \frac{1}{D}\|\xi_i - Y_j^{\text{patch}}\|_2^2$ and context distances $C_{ij}^{\text{ctx}} = \|\hat{h}_i^{\text{global}} - \hat{h}_j^{\text{global}}\|_2^2$ by their respective neighborhood medians ($\tilde{C}^{\text{state}}, \tilde{C}^{\text{ctx}}$) so $\lambda_h$ is dimensionless and tunable. Set infeasible off-diagonal log-kernel entries explicitly to $-\infty$ (never finite $10^6$ penalties):
 
-## 13.2 Probabilistic quality
+$$
+\log K_{ij} = \begin{cases} -\dfrac{1}{\varepsilon_{\text{OT}}}\left(\tilde{C}_{ij}^{\text{state}} + \lambda_h \tilde{C}_{ij}^{\text{ctx}}\right), & \text{if } M_{ij} = 1, \\[10pt] -\infty, & \text{if } M_{ij} = 0. \end{cases}
+$$
 
-Use:
+4. **Convergence Check & Automatic Fallback:** Run stabilized masked log-domain Sinkhorn iterations in FP32. Verify that dual potentials are finite and marginal error satisfies $\|\Pi\mathbf{1} - a\|_1 + \|\Pi^\top\mathbf{1} - b\|_1 < 10^{-4}$. If sparse support causes convergence failure, automatically fall back to $\Pi = \operatorname{diag}(1/B_g)$ (same-context pairing) and log the fallback rate. Always condition the DiT on **`paired_context = h_j`**.
 
-- Energy Score.
-- Variogram Score.
-- Marginal CRPS for individual stocks and horizons.
-- Prediction interval coverage.
-- Prediction interval width.
-- Calibration by forecast horizon and market regime.
+5. **Monte Carlo Estimate of Symmetric Mixture KL (Validation Diagnostic):** On validation neighborhoods, compute an $S = 128$-sample Monte Carlo estimate (plus standard error across repeated draws) of true symmetric mixture KL using full joint summed log-densities inside `logsumexp`, dividing by $D$ only after taking the difference:
 
-For example, nominal 90% prediction intervals should be checked for approximately 90% empirical coverage over sufficiently many test observations.
+$$
+\log q_b(\xi \mid h) = \operatorname{logsumexp}\!\begin{bmatrix} \log \rho + \log P_{\text{new}}^{\text{sum}}(\xi \mid h) \\ \log(1 - \rho) + \log P_{\text{old}}^{\text{sum}}(\xi \mid h) \end{bmatrix},
+$$
 
-## 13.3 Cross-stock dependence
+$$
+\widehat{\overline{D}}_{KL}^{\text{MC}}(q_i \Vert q_j) = \frac{1}{S D}\sum_{s=1}^{S}\Big[\log q_b(\xi_s \mid h_i) - \log q_b(\xi_s \mid h_j)\Big], \qquad \widehat{\overline{D}}_{\text{sym}}^{\text{MC}} = \frac{1}{2}\Big(\widehat{\overline{D}}_{KL}^{\text{MC}}(q_i \Vert q_j) + \widehat{\overline{D}}_{KL}^{\text{MC}}(q_j \Vert q_i)\Big).
+$$
 
-Compare generated and realized:
+## 5.4 Pushforward-Invariance Principle
 
-- Correlation matrices.
-- Sector correlations.
-- Pairwise return distributions.
-- Tail dependence.
-- Cross-asset lead–lag statistics.
-
-## 13.4 Financial statistical realism
-
-Evaluate:
-
-| Property | Example diagnostic |
-|---|---|
-| Volatility clustering | ACF of squared returns |
-| Heavy tails | Skewness, kurtosis, tail quantiles |
-| Return autocorrelation | ACF of returns |
-| Cross-asset dependence | Correlation and tail dependence |
-| Drawdowns | Maximum drawdown distribution |
-| Regime behaviour | Regime-conditioned statistics |
-
-These should be evaluated across generated ensembles and multiple historical windows.
-
-## 13.5 Optimization stability
-
-Track:
-
-1. Moving-reference KL divergence per outer iteration.
-2. Prior entropy and predicted variance.
-3. Generator diffusion loss.
-4. Validation Energy Score and Variogram Score.
-5. Ensemble diversity.
-6. Mean reward across training windows.
-7. Online-versus-EMA performance.
-8. Performance on old-prior versus new-prior samples after each generator block.
-
-A useful plot is:
-
-\[
-KL_b=
-D_{KL}\left(
-P_{\bar\psi^{(b)}}\Vert P_{\bar\psi^{(b-1)}}
-\right),
-\]
-
-which measures prior movement between outer iterations.
-
-Also plot prior movement against generator validation improvement. Large prior movement followed by degraded generator calibration can indicate that the prior is moving faster than the generator can adapt.
+Under infinite model capacity and exact ODE integration, minimizing $\mathcal{L}_{\text{CFM}}^{(b)}$ transports any full-support source distribution $q_b(\cdot \mid h_t)$ to the identical target distribution $p(Y_t^{\text{patch}} \mid h_t)$. Therefore, v4.3 adapts $P_\psi$ to reduce transport displacement, enforce constant-velocity straightness, and cut inference NFE while preserving unbiased probabilistic calibration.
 
 ---
 
-# 14. Ablation studies
+# 6. FP32 ODE Integration & Discrete Constant-Velocity Straightness Cost
 
-The following experiments isolate the contribution of each proposed component.
+## 6.1 FP32 Fixed-Step Heun Integrator
 
-| Experiment | Prior | Generator optimization | Purpose |
+Even when `PatchedFlowDiT` executes internally under `bfloat16` autocast, **all ODE states, predictor states, and velocity updates remain strictly in `float32`** to prevent low-precision drift across integration steps. Given $\xi_0 \sim P_{\text{source}}(\cdot \mid h_t)$ and $K$ steps ($\Delta\tau = 1/K$, $\tau_m = m\Delta\tau$):
+
+$$
+z_0 = \operatorname{fp32}(\xi_0),
+$$
+
+$$
+k_{1,m} = \operatorname{fp32}\!\big(v_\theta(z_m, \tau_m, h_t)\big), \qquad z_{\text{pred}, m} = z_m + \Delta\tau\, k_{1,m},
+$$
+
+$$
+k_{2,m} = \operatorname{fp32}\!\big(v_\theta(z_{\text{pred}, m}, \tau_{m+1}, h_t)\big), \qquad z_{m+1} = z_m + \frac{\Delta\tau}{2}(k_{1,m} + k_{2,m}).
+$$
+
+Each step costs $2$ NFE ($2K$ total NFE). Denote the terminal ODE state as $z(1) \triangleq z_K$, and unpatchify to $\hat{Y}_t = \mathcal{P}_p^{-1}(z(1))$.
+
+## 6.2 Discrete Constant-Velocity Straightness Cost
+
+Define the continuous **Constant-Velocity Straightness Cost** along path $z(\tau)$ with total displacement $\Delta z = z(1) - z(0)$:
+
+$$
+C_{\text{straight}}(\xi_0; h_t) = \frac{1}{D}\int_0^1 \left\|v(z(\tau), \tau, h_t) - \Delta z\right\|_2^2 d\tau.
+$$
+
+This measures deviation from constant-velocity straight-line motion (not purely geometric curvature): when $C_{\text{straight}} = 0$, a single Euler step recovers $z(1) = \xi_0 + \Delta z$ identically regardless of $\|\Delta z\|_2$, preserving tail trajectories.
+
+Under $K$-step Heun integration, $\Delta z = \frac{1}{2K}\sum_{m=0}^{K-1}(k_{1,m} + k_{2,m})$. By the variance identity, the discrete Heun trapezoidal straightness estimator simplifies **exactly** (for the discrete $K$-step Heun grid) to:
+
+$$
+\hat{C}_{\text{straight}}^{(K)}(\xi_0; h_t) = \frac{1}{D}\left[\frac{1}{2K}\sum_{m=0}^{K-1}\left(\|k_{1,m}\|_2^2 + \|k_{2,m}\|_2^2\right) - \|z(1) - z(0)\|_2^2\right].
+$$
+
+**Engineering & diagnostic properties:**
+
+* **Zero extra NFE over an existing Heun rollout**, though evaluating $M$ rollouts in Block A still requires $2KM$ DiT evaluations per context ($320$ calls/context at $M = 20, K = 8$), tracked explicitly in total compute budgets.
+* **$O(D)$ working memory, independent of $K$:** Stores only current FP32 $z$, $z_{\text{pred}}$, $k_1$, $k_2$, and a scalar FP32 accumulator (clamped at `0.0`).
+* **Deterministic evaluation:** Frozen EMA DiT is always placed in `.eval()` mode during Block A rollouts.
+* **Multi-resolution check:** Log Spearman rank correlation of $\hat{C}_{\text{straight}}^{(K)}$ across $K \in \{4, 8, 16, 32\}$ to confirm the prior is not exploiting coarse-grid artifacts.
+
+---
+
+# 7. Block A: Generator-Coupled Prior Optimization
+
+At the start of outer iteration $b$, freeze immutable snapshots $P_{\text{ref}}^{(b)} = P_{\bar{\psi}^{(b)}}$ and $v_{\text{ref}}^{(b)} = v_{\bar{\theta}^{(b)}}$ (both in `.eval()` mode). Only online prior parameters $\psi$ are trainable.
+
+## 7.1 Strictly Proper Coordinate-Normalized Gaussian NLL
+
+$$
+\mathcal{L}_{\text{NLL}}(\psi) = -\frac{1}{BD}\sum_{t=1}^{B}\log P_\psi^{\text{sum}}\!\big(Y_t^{\text{patch}} \mid h_t\big) = \frac{1}{2BD}\sum_{t=1}^{B}\sum_{d=1}^{D}\left[\log\!\big(2\pi\sigma_{\psi,t,d}^2\big) + \frac{(Y_{t,d}^{\text{patch}} - \mu_{\psi,t,d})^2}{\sigma_{\psi,t,d}^2}\right].
+$$
+
+Never mix a Student-$t$ log-likelihood with a Gaussian sampling prior. Rely on bounded $\sigma_{\max}$, gradient clipping, and boundary-saturation logging; defer a true conditional Student-$t$ prior (with Student-$t$ sampling and MC KL) to Stage 6.
+
+## 7.2 Consistent Local Distributional Transport: Sinkhorn Divergence & Monte Carlo $\widehat{\text{SW}}_2^2$
+
+1. **Form tight local context neighborhoods first (Approach A):** Group training windows into local neighborhoods $g \in G$ of size $B_g \in \{24, 32\}$ via nearest neighbors in normalized frozen $\hat{h}_t^{\text{global}}$ (optionally requiring regime agreement). Draw **attached reparameterized samples** $\xi_i = \mu_\psi(h_i) + \sigma_\psi(h_i) \odot \epsilon_i$ (`rsample`) for $i \in g$, and collect detached realized targets $Q_g = \{Y_j^{\text{patch}}\}_{j \in g}$.
+2. **Consistent Local Sinkhorn Divergence:** Apply the **exact same pure state ground cost** $c(x, y) = \frac{1}{D}\|x - y\|_2^2$ across all three entropic OT terms:
+
+$$
+S_\varepsilon(P_{\psi, g}, Q_g) = \operatorname{OT}_\varepsilon(P_{\psi, g}, Q_g) - \frac{1}{2}\operatorname{OT}_\varepsilon(P_{\psi, g}, P_{\psi, g}) - \frac{1}{2}\operatorname{OT}_\varepsilon(Q_g, Q_g).
+$$
+
+3. **Monte Carlo Approximation of Empirical Sliced Wasserstein-2 ($\widehat{\text{SW}}_2^2$):** Over $L_{\text{proj}} \in \{128, 256, 512\}$ random unit directions $\theta_\ell \sim \mathcal{U}(\mathbb{S}^{D-1})$ (evaluated across multiple projection seeds for Monte Carlo variance diagnostics):
+
+$$
+\mathcal{L}_{\text{SW2}}(\psi) = \frac{1}{|G| L_{\text{proj}} B_g}\sum_{g \in G}\sum_{\ell = 1}^{L_{\text{proj}}}\sum_{r = 1}^{B_g}\left(\operatorname{sort}\!\big(\{\theta_\ell^\top \xi_i\}_{i \in g}\big)_{(r)} - \operatorname{sort}\!\big(\{\theta_\ell^\top Y_j^{\text{patch}}\}_{j \in g}\big)_{(r)}\right)^2,
+$$
+
+with per-group complexity $O\big(L_{\text{proj}} B_g (D + \log B_g)\big)$ and zero entropic bias. Compare local Sinkhorn Divergence, Sliced Sinkhorn, and $\widehat{\text{SW}}_2^2$ in Stage 2 to select the default $\mathcal{L}_{\text{dist}}$.
+
+## 7.3 Generator-Dependent Straightness Policy Gradient (RLOO)
+
+All candidate samples $\xi_{0,t}^{(i)}$ are rolled out under `torch.no_grad()` in FP32 through frozen `dit_ref.eval()` to obtain $C_{t,i} = \hat{C}_{\text{straight}}^{(K)}(\xi_{0,t}^{(i)}; h_t)$ (already divided by $D$), and explicitly **detached** before calling `log_prob_sum`.
+
+* **Canonical Baseline — Independent-Sample RLOO:** Draw $M$ i.i.d. samples $\xi_{0,t}^{(i)} = \operatorname{sg}(\mu_\psi(h_t) + \sigma_\psi(h_t) \odot \epsilon_{t,i})$:
+
+$$
+b_{t, -i} = \frac{1}{M - 1}\sum_{j \neq i} C_{t, j}, \qquad A_{t, i} = \frac{C_{t, i} - b_{t, -i}}{\hat{\sigma}_{C, \text{prev}} + \varepsilon}.
+$$
+
+* **Ablation Variant — Pair-Level Antithetic RLOO (Exp M1):** Draw $M_p = M/2$ pairs $\xi_{t,m}^\pm = \operatorname{sg}(\mu_\psi \pm \sigma_\psi \odot \epsilon_{t,m})$, compute pair means $\bar{C}_{t,m} = \frac{1}{2}(C_{t,m}^+ + C_{t,m}^-)$, and exclude the entire pair $m$:
+
+$$
+b_{t, -m} = \frac{1}{M_p - 1}\sum_{n \neq m} \bar{C}_{t, n}, \qquad A_{t, m}^\pm = \frac{C_{t, m}^\pm - b_{t, -m}}{\hat{\sigma}_{C, \text{prev}} + \varepsilon}.
+$$
+
+* **Full Joint Summed Log-Probability & Past-Batch Scale:**
+
+$$
+\mathcal{L}_{\text{straight-PG}}(\psi) = \frac{1}{B M}\sum_{t=1}^{B}\sum_{i=1}^{M} \operatorname{sg}\!\big(A_{t, i}\big)\,\log P_\psi^{\text{sum}}\!\Big(\operatorname{sg}\!\big(\xi_{0, t}^{(i)}\big) \mid h_t\Big).
+$$
+
+* **Strict Estimator Qualifications:**
+  1. Read $\hat{\sigma}_{C, \text{prev}}$ from **strictly previous batches** *before* calling `running_cost_std.update(costs)`.
+  2. Leave $A_{t,i}$ unclipped in the canonical mode (advantage clipping is a labeled biased ablation).
+  3. **Unbiasedness vs. gradient clipping:** Both score-function gradient estimators are mathematically unbiased **prior to nonlinear gradient clipping** (`clip_grad_norm_`). Because clipping introduces bias into the practical optimizer step whenever activated, log the **clipping activation percentage** every epoch alongside the live gradient-norm ratio $\|\nabla_\psi(\lambda_{\text{straight}}\mathcal{L}_{\text{straight-PG}})\|_2 / \|\nabla_\psi(\lambda_{\text{NLL}}\mathcal{L}_{\text{NLL}})\|_2$.
+
+## 7.4 Moving-Reference Per-Coordinate KL Trust Region & Epoch Dual Update
+
+$$
+\overline{D}_{KL}(P_\psi \Vert P_{\text{ref}}^{(b)}) = \frac{1}{2 B D}\sum_{t=1}^{B}\sum_{d=1}^{D}\left[\log\frac{\sigma_{r,t,d}^2}{\sigma_{\psi,t,d}^2} + \frac{\sigma_{\psi,t,d}^2 + (\mu_{\psi,t,d} - \mu_{r,t,d})^2}{\sigma_{r,t,d}^2} - 1\right].
+$$
+
+The primal Block A objective is:
+
+$$
+\mathcal{L}_P^{(b)}(\psi) = \lambda_{\text{NLL}}\mathcal{L}_{\text{NLL}}(\psi) + \lambda_{\text{dist}}\mathcal{L}_{\text{dist}}(\psi) + \lambda_{\text{straight}}\mathcal{L}_{\text{straight-PG}}(\psi) + \beta_b\, \overline{D}_{KL}\!\big(P_\psi \Vert P_{\text{ref}}^{(b)}\big).
+$$
+
+Update $\beta_b$ **once per epoch** using epoch-mean detached KL $\widehat{D}_{KL}^{\text{epoch}}$:
+
+$$
+\beta_b \leftarrow \operatorname{clip}\!\left(\beta_b \exp\!\Big[\eta_\beta\big(\widehat{D}_{KL}^{\text{epoch}} - \delta\big)\Big],\; \beta_{\min},\; \beta_{\max}\right),
+$$
+
+with $\delta \in [0.02, 0.05]$ nats/coord, $\beta_0 = 1.0$, $\eta_\beta = 0.5$, $\beta_{\min} = 0.05$, $\beta_{\max} = 50.0$. Update `ema_prior` ($\bar{\psi} \leftarrow \alpha_P \bar{\psi} + (1 - \alpha_P)\psi$) after every step while keeping $P_{\text{ref}}^{(b)}$ frozen.
+
+---
+
+# 8. Block B: Source-Matched Generator Optimization & Explicit Scoring Rules
+
+Freeze $P_{\text{old}}^{(b)} = P_{\bar{\psi}^{(b)}}$ and $P_{\text{new}}^{(b)} = P_{\bar{\psi}^{(b+1)}}$, and form the fixed Block B mixture $q_b(\xi_0 \mid h_t) = \rho P_{\text{new}}^{(b)}(\xi_0 \mid h_t) + (1 - \rho) P_{\text{old}}^{(b)}(\xi_0 \mid h_t)$ ($\rho = 0.70$). Only online DiT parameters $\theta$ are trainable:
+
+$$
+\mathcal{L}_G^{(b)}(\theta) = \lambda_{\text{CFM}}\mathcal{L}_{\text{CFM}}^{(b)}(\theta; q_b) + \lambda_{\text{ES}}\mathcal{L}_{\text{ES}}(\theta; q_b) + \lambda_{\text{VS}}\mathcal{L}_{\text{VS}}(\theta; q_b).
+$$
+
+Start with pure CFM ($\lambda_{\text{ES}} = \lambda_{\text{VS}} = 0$), then add low-weight proper scores on $M_{\text{grad}} = 6\text{--}8$ rollouts (comparing checkpointed full backprop vs. FlowBP-style sparse gradients in Exp M3).
+
+## 8.1 Complete Explicit Formulas for Proper Scoring Rules
+
+1. **Unbiased Energy Score:**
+
+$$
+\mathcal{L}_{\text{ES}} = \frac{1}{B}\sum_{t=1}^{B}\left[\frac{1}{M}\sum_{m=1}^{M}\frac{\|\hat{Y}_t^{(m)} - Y_t\|_2}{\sqrt{D}} - \frac{1}{2 M(M - 1)}\sum_{m \neq m'}\frac{\|\hat{Y}_t^{(m)} - \hat{Y}_t^{(m')}\|_2}{\sqrt{D}}\right].
+$$
+
+2. **Explicit Factored Structured Variogram Score ($p_{\text{var}} = 0.5$):**
+
+For coordinate indices $a = (h_1, n_1)$ and $b = (h_2, n_2)$ in $\{1, \dots, H\} \times \{1, \dots, N\}$, define the squared pairwise variogram error on an $M$-member ensemble:
+
+$$
+d_{p_{\text{var}}}(a, b; Y, \hat{Y}) = \left(\left|Y_a - Y_b\right|^{p_{\text{var}}} - \frac{1}{M}\sum_{m=1}^{M}\left|\hat{Y}_a^{(m)} - \hat{Y}_b^{(m)}\right|^{p_{\text{var}}}\right)^2.
+$$
+
+Partition pairs into three explicit subsets:
+
+* **Temporal subset $\mathcal{S}_{\text{temp}}$:** $\{((h_1, n), (h_2, n)) : 1 \le h_1 < h_2 \le H,\; 1 \le n \le N\}$, cardinality $|\mathcal{S}_{\text{temp}}| = N\binom{H}{2} = 9,500$.
+* **Cross-asset subset $\mathcal{S}_{\text{asset}}$:** $\{((h, n_1), (h, n_2)) : 1 \le h \le H,\; 1 \le n_1 < n_2 \le N\}$, cardinality $|\mathcal{S}_{\text{asset}}| = H\binom{N}{2} = 24,500$.
+* **Cross-time/cross-asset subset $\mathcal{S}_{\text{cross}}$:** Uniform random draw without replacement of $K_{\text{cross}} = 2,000$ distinct pairs $((h_1, n_1), (h_2, n_2))$ with $h_1 \ne h_2$ and $n_1 \ne n_2$ (using a **fixed deterministic pair tensor** for validation/test reproducibility, and freshly resampled uniformly per minibatch during training).
+
+Normalize each component by its subset cardinality (default $\lambda_t = \lambda_a = \lambda_x = 1/3$):
+
+$$
+\mathcal{L}_{\text{VS}} = \frac{1}{B}\sum_{t=1}^{B}\left[\frac{\lambda_t}{|\mathcal{S}_{\text{temp}}|}\sum_{(a,b)\in\mathcal{S}_{\text{temp}}} d_{p_{\text{var}}}(a,b) + \frac{\lambda_a}{|\mathcal{S}_{\text{asset}}|}\sum_{(a,b)\in\mathcal{S}_{\text{asset}}} d_{p_{\text{var}}}(a,b) + \frac{\lambda_x}{|\mathcal{S}_{\text{cross}}|}\sum_{(a,b)\in\mathcal{S}_{\text{cross}}} d_{p_{\text{var}}}(a,b)\right].
+$$
+
+## 8.2 Diagnostics, Matched Checkpoints & Mandatory Post-Calibration Validation
+
+1. **Three-point straightness oscillation diagnostic:** Log FP32 $\hat{C}_{\text{straight}}(P_{\text{new}}^{(b)}, v_{\text{old}}^{(b)})$ (after Block A), $\hat{C}_{\text{straight}}(P_{\text{new}}^{(b)}, v_{\text{new}}^{(b)})$ (after Block B), and $\hat{C}_{\text{straight}}(P_{\text{new}}^{(b+1)}, v_{\text{new}}^{(b)})$ (after next Block A).
+2. **Dual validation & matched checkpoint pairs:** After every Block B, validate `ema_dit.eval()` using both $q_b$ and standalone $P_{\text{new}}^{(b)}$. Always save and load matched `(ema_prior, ema_dit)` pairs together.
+3. **Final deployment calibration ($\rho = 1.0$) + post-calibration validation:** Load the best validation **pre-calibration pair**, freeze $P_{\text{deploy}} = P_{\bar{\psi}^*}$, run $5\text{--}10$ epochs of pure $P_{\text{deploy}}$-source CFM calibration, save the **post-calibration pair**, and validate it on the validation split. Select pre- vs. post-calibration strictly on validation before touching the chronological test split.
+4. **Stage 6 optional solver-aware prior objective:** Evaluate $C_{\text{solver}}(\xi_0; h_t) = \frac{1}{D}\|G_{\text{Heun}, K_{\text{low}}}(\xi_0, h_t) - G_{\text{Heun}, K_{\text{ref}}}(\xi_0, h_t)\|_2^2$ ($K_{\text{low}} = 2, K_{\text{ref}} = 16$) strictly as a Stage 6 efficiency extension—always paired with independent probabilistic forecast scoring so solver stability is never confused with forecast accuracy.
+
+---
+
+# 9. Complete Reference Training Algorithm (PyTorch-Style Pseudocode)
+
+```python
+# ==============================================================================
+# Modules:
+#   market_encoder (E_phi):  Frozen after Stage 1 baseline CFM pretraining
+#   online_prior (P_psi):    Dual-head bounded conditionally factorized Gaussian
+#   ema_prior (P_psi_bar):   EMA copy of online_prior (alpha_P = 0.995)
+#   online_dit (v_theta):    Trainable spatiotemporal DiT (p in {1, 2, 4})
+#   ema_dit (v_theta_bar):   EMA copy of online_dit (alpha_G = 0.999)
+# State shape: (B, H_p, N, p) with D = H_p * N * p = 1000
+# ==============================================================================
+
+def heun_rollout_fp32_with_straightness(vel_net, xi_0, ctx, num_steps=8):
+    """Exact discrete Heun constant-velocity straightness; FP32 state/accum; O(D) mem wrt K."""
+    z = xi_0.float()
+    z0 = z
+    dt = 1.0 / num_steps
+    sum_v_sq = torch.zeros(z.shape[0], device=z.device, dtype=torch.float32)
+
+    for m in range(num_steps):
+        t0 = torch.full((z.shape[0],), m * dt, device=z.device, dtype=torch.float32)
+        t1 = torch.full((z.shape[0],), (m + 1) * dt, device=z.device, dtype=torch.float32)
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            k1 = vel_net(z, t0, ctx)
+        k1_f = k1.float()
+        z_pred = z + dt * k1_f
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            k2 = vel_net(z_pred, t1, ctx)
+        k2_f = k2.float()
+        z = z + 0.5 * dt * (k1_f + k2_f)
+
+        sum_v_sq += k1_f.pow(2).mean(dim=(1, 2, 3))
+        sum_v_sq += k2_f.pow(2).mean(dim=(1, 2, 3))
+
+    mean_v_sq = sum_v_sq / (2.0 * num_steps)
+    disp_sq = (z - z0).pow(2).mean(dim=(1, 2, 3))
+    straight_cost = (mean_v_sq - disp_sq).clamp_min(0.0)
+    return z, straight_cost
+
+
+def compute_rloo_advantages(costs, prev_scale, antithetic=False, clip_val=None):
+    """
+    Score-function RLOO (unbiased prior to any advantage or gradient clipping).
+    Uses strictly PREVIOUS-BATCH running std (prev_scale).
+    """
+    B, M = costs.shape
+    denom = prev_scale + 1e-6
+
+    if not antithetic:  # Canonical baseline: independent samples
+        sum_c = costs.sum(dim=1, keepdim=True)
+        baseline = (sum_c - costs) / (M - 1)
+        adv = (costs - baseline) / denom
+    else:               # Ablation M1: pair-level antithetic RLOO
+        assert M % 2 == 0 and M >= 4
+        Mp = M // 2
+        c_pos, c_neg = costs[:, :Mp], costs[:, Mp:]
+        c_pair_mean = 0.5 * (c_pos + c_neg)
+        sum_pairs = c_pair_mean.sum(dim=1, keepdim=True)
+        pair_baseline = (sum_pairs - c_pair_mean) / (Mp - 1)
+        adv = torch.cat([(c_pos - pair_baseline) / denom,
+                         (c_neg - pair_baseline) / denom], dim=1)
+
+    if clip_val is not None:  # Biased-stabilization ablation only
+        adv = adv.clamp(-clip_val, clip_val)
+    return adv
+
+
+beta_kl = 1.0
+running_cost_std = RunningEMAStd(momentum=0.95, init_value=1.0)
+
+for b in range(num_outer_steps):
+    prior_ref = frozen_copy(ema_prior).eval()
+    dit_ref = frozen_copy(ema_dit).eval()  # Deterministic rollouts
+
+    # ==========================================================================
+    # BLOCK A: GENERATOR-COUPLED PRIOR OPTIMIZATION
+    # ==========================================================================
+    set_trainable(online_prior, True)
+    online_prior.train()
+    set_trainable(online_dit, False)
+
+    for epoch in range(prior_epochs):
+        prior_loader.dataset.set_random_offset()  # Stride S in {5, 10, 20}
+        epoch_kl_vals, clip_hits, total_steps = [], 0, 0
+
+        for step_idx, (past_x, future_y_patch, meta) in enumerate(prior_loader):
+            B = past_x.shape[0]
+            with torch.no_grad():
+                ctx = market_encoder(past_x)
+
+            # 1. Strictly Proper Coordinate-Normalized Gaussian NLL
+            nll_loss = -online_prior.log_prob_per_dim(future_y_patch, ctx).mean()
+
+            # 2. Consistent Local Distributional Transport (ATTACHED rsample!)
+            xi_dist = online_prior.rsample(ctx)
+            if dist_loss_type == "sw2":
+                dist_loss = local_mc_sliced_wasserstein2(
+                    xi_dist, future_y_patch, ctx.global_emb, meta, num_proj=256
+                )
+            else:
+                dist_loss = local_consistent_sinkhorn_divergence(
+                    xi_dist, future_y_patch, ctx.global_emb, meta, eps_ot=eps_ot
+                )
+
+            # 3. Generator-Dependent Straightness PG (DETACHED samples, FP32 ODE!)
+            with torch.no_grad():
+                mu, sigma = online_prior.dist_params(ctx)
+                if use_antithetic_pairs:
+                    eps_half = torch.randn((B, M // 2, *mu.shape[1:]), device=mu.device)
+                    eps = torch.cat([eps_half, -eps_half], dim=1)
+                else:
+                    eps = torch.randn((B, M, *mu.shape[1:]), device=mu.device)
+                xi_pg = (mu.unsqueeze(1) + sigma.unsqueeze(1) * eps).detach()
+
+                flat_xi = xi_pg.flatten(0, 1)
+                flat_ctx = ctx.repeat_interleave(M, dim=0)
+                _, flat_costs = heun_rollout_fp32_with_straightness(
+                    dit_ref, flat_xi, flat_ctx, num_steps=heun_steps_block_a
+                )
+                costs = flat_costs.view(B, M)
+
+                # Read previous-batch scale strictly BEFORE updating
+                prev_scale = running_cost_std.value
+                adv = compute_rloo_advantages(
+                    costs, prev_scale,
+                    antithetic=use_antithetic_pairs,
+                    clip_val=adv_clip_ablation  # None in canonical unbiased mode
+                )
+                running_cost_std.update(costs)
+
+            # Full joint summed log_prob (no double 1/D scaling)
+            log_p_sum = online_prior.log_prob_sum(
+                xi_pg.flatten(0, 1).detach(), flat_ctx
+            ).view(B, M)
+            straight_pg_loss = (adv.detach() * log_p_sum).mean()
+
+            # 4. Moving-Reference Per-Coordinate KL
+            kl_per_dim = conditional_kl_per_dim(online_prior, prior_ref, ctx).mean()
+            epoch_kl_vals.append(kl_per_dim.detach().item())
+
+            if epoch == 0 and step_idx == 0:
+                log_grad_norm_ratio(online_prior, lambda_straight * straight_pg_loss,
+                                    lambda_nll * nll_loss)
+
+            prior_loss = (
+                lambda_nll * nll_loss
+                + lambda_dist * dist_loss
+                + lambda_straight * straight_pg_loss
+                + beta_kl * kl_per_dim
+            )
+
+            prior_opt.zero_grad(set_to_none=True)
+            prior_loss.backward()
+            grad_norm = clip_grad_norm_(online_prior.parameters(), max_norm=1.0)
+            clip_hits += int(grad_norm > 1.0)
+            total_steps += 1
+            prior_opt.step()
+            update_ema(ema_prior, online_prior, decay=alpha_P)
+
+        mean_epoch_kl = sum(epoch_kl_vals) / len(epoch_kl_vals)
+        beta_kl = float(
+            np.clip(beta_kl * math.exp(eta_beta * (mean_epoch_kl - delta_kl)), 0.05, 50.0)
+        )
+        log_prior_epoch(b, epoch, mean_epoch_kl, beta_kl, clip_rate=clip_hits / total_steps)
+
+    prior_new = frozen_copy(ema_prior).eval()
+    source_mixture = FrozenMixture([prior_new, prior_ref], weights=[rho, 1.0 - rho])
+    c_straight_pre_b = eval_mean_straightness_fp32(prior_new, dit_ref, market_encoder, val_loader)
+
+    # ==========================================================================
+    # BLOCK B: SOURCE-MATCHED GENERATOR OPTIMIZATION
+    # ==========================================================================
+    set_trainable(online_prior, False)
+    set_trainable(online_dit, True)
+    online_dit.train()
+
+    for epoch in range(generator_epochs):
+        for past_x, future_y_patch, meta in generator_loader:
+            with torch.no_grad():
+                ctx = market_encoder(past_x)
+                xi_0 = source_mixture.sample(ctx).detach()
+
+            # Same-context baseline OR Symmetric-KL-Masked Log-Domain Sinkhorn OT
+            # Uniform marginals a=b=1/B_g; fallback to diagonal on convergence failure; paired_ctx=ctx[j]
+            xi_pair, y_pair, ctx_pair, ot_diag = make_cfm_pairs(
+                xi_0, future_y_patch, ctx, source_mixture, meta,
+                mode=coupling_mode, delta_context=delta_context
+            )
+
+            tau = sample_flow_time(xi_pair.shape[0], mode=time_sampling_mode)
+            tau_view = tau.view(-1, 1, 1, 1)
+            z_tau = (1.0 - tau_view) * xi_pair + tau_view * y_pair
+            u_target = y_pair - xi_pair
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                v_pred = online_dit(z_tau, tau, ctx_pair)
+                cfm_loss = (v_pred.float() - u_target.float()).pow(2).mean()
+
+            if lambda_es > 0.0 or lambda_vs > 0.0:
+                ens_patch = differentiable_ode_rollout_fp32(
+                    online_dit, source_mixture, ctx, num_samples=M_grad,
+                    steps=heun_steps_block_b, mode=ode_backprop_mode
+                )
+                ens_y, true_y = unpatchify(ens_patch), unpatchify(future_y_patch)
+                es_loss = unbiased_energy_score(ens_y, true_y)
+                vs_loss = factored_variogram_score(ens_y, true_y, fixed_cross_pairs=None)
+            else:
+                es_loss = vs_loss = 0.0
+
+            gen_loss = lambda_cfm * cfm_loss + lambda_es * es_loss + lambda_vs * vs_loss
+
+            gen_opt.zero_grad(set_to_none=True)
+            gen_loss.backward()
+            clip_grad_norm_(online_dit.parameters(), max_norm=1.0)
+            gen_opt.step()
+            update_ema(ema_dit, online_dit, decay=alpha_G)
+
+    ema_dit_eval = frozen_copy(ema_dit).eval()
+    c_straight_post_b = eval_mean_straightness_fp32(prior_new, ema_dit_eval, market_encoder, val_loader)
+
+    # Dual Validation + Saturation + Multi-K Rank Stability + MC Symmetric Mixture KL (S=128)
+    val_mix = validate_ensemble(source_mixture, ema_dit_eval, market_encoder, val_loader)
+    val_new = validate_ensemble(prior_new, ema_dit_eval, market_encoder, val_loader)
+    sat_stats = log_sigma_saturation(prior_new, market_encoder, val_loader)
+    rank_corr = eval_multi_k_straightness_rank_corr(prior_new, ema_dit_eval, market_encoder, val_loader)
+    mc_mix_kl, mc_mix_se = eval_mc_sym_mixture_kl(source_mixture, market_encoder, val_loader, num_mc=128)
+    log_diagnostics(b, beta_kl, c_straight_pre_b, c_straight_post_b, val_mix, val_new,
+                    sat_stats, rank_corr, ot_diag, mc_mix_kl, mc_mix_se)
+    checkpoint_matched_pair_if_improved(val_new, ema_prior, ema_dit, tag="pre_calibration")
+
+# ==============================================================================
+# FINAL DEPLOYMENT CALIBRATION (rho = 1.0) + MANDATORY POST-CALIBRATION VALIDATION
+# ==============================================================================
+load_matched_checkpoint_pair(ema_prior, ema_dit, tag="pre_calibration")
+prior_deploy = frozen_copy(ema_prior).eval()
+online_dit.load_state_dict(ema_dit.state_dict())
+
+run_final_cfm_calibration(online_dit, ema_dit, prior_deploy, market_encoder,
+                          generator_loader, epochs=calibration_epochs)
+
+val_post_calib = validate_ensemble(prior_deploy, ema_dit.eval(), market_encoder, val_loader)
+save_matched_checkpoint_pair(prior_deploy, ema_dit, val_post_calib, tag="post_calibration")
+# Run untouched chronological test evaluation ONLY after selecting pre- vs post-calib on val!
+```
+
+---
+
+# 10. Inference, Evaluation Triad, Ablation Matrix & Dual Compute Parity
+
+## 10.1 Inference Pipeline
+
+At test time, zero target information or reward selection is accessed:
+
+1. Encode market history: $h_t = E_\phi(X_t^{\text{past}})$.
+2. Draw $M$ initial source latents from the validated deployment prior: $\xi_0^{(i)} \sim P_{\text{deploy}}(\cdot \mid h_t)$.
+3. Integrate the calibrated EMA DiT $v_{\bar{\theta}}$ (in `.eval()` mode, FP32 ODE state) from $\tau = 0$ to $\tau = 1$ at the target NFE budget to obtain $z^{(i)}(1)$.
+4. Unpatchify $\hat{Y}_t^{(i)} = \mathcal{P}_p^{-1}\!\big(z^{(i)}(1)\big) \in \mathbb{R}^{H \times N \times 1}$.
+5. Reconstruct future price trajectories using strictly causal scale $s_{n,t}$:
+
+$$
+\hat{P}_{n, t + h}^{(i)} = P_{n, t} \exp\!\left(s_{n, t}\sum_{j=1}^{h}\hat{\tilde{r}}_{n, t + j}^{(i)}\right).
+$$
+
+## 10.2 Three-Axis Evaluation Triad & Standardized NFE Grid
+
+Evaluate all models on untouched chronological test periods using block-bootstrap / Diebold–Mariano tests accounting for overlapping $20$-day horizons:
+
+1. **Transport Efficiency:** Coupling-indexed displacement $D_{\text{transport}}(\pi)$, local Sinkhorn Divergence / $\widehat{\text{SW}}_2^2$ (across multiple projection seeds), FP32 constant-velocity straightness $\hat{C}_{\text{straight}}^{(K)}$ across $K \in \{4, 8, 16, 32\}$, pre/post-Block B straightness stability, $\sigma_\psi$ boundary saturation, and exploratory correlation between marginal $\sigma_\psi(h_t)$ and scale-normalized realized future volatility $\sigma_{i,t}^{\text{future, norm}} = \sigma(r_{i, t+1:t+H}) / s_{i,t}$.
+2. **Computational Efficiency (Primary Pareto Frontier):** Evaluate fixed-step solvers at compatible function-evaluation budgets:
+
+$$
+\text{NFE} \in \{4, 8, 16, 32, 64\}
+$$
+
+mapping to Euler ($1$ NFE/step $\Rightarrow K \in \{4, 8, 16, 32, 64\}$), Heun ($2$ NFE/step $\Rightarrow K \in \{2, 4, 8, 16, 32\}$), and RK4 ($4$ NFE/step $\Rightarrow K \in \{1, 2, 4, 8, 16\}$), plus realized NFE and wall-clock latency for adaptive Dormand–Prince. Also log endpoint discrepancy against a $64$-NFE reference. Primary figure: **Probabilistic Score vs. NFE and Wall-Clock Latency**.
+3. **Probabilistic Forecasting & Financial Realism:** Unbiased Energy Score, Explicit Factored Variogram Score (fixed validation/test $\mathcal{S}_{\text{cross}}$), marginal CRPS, $90\%$ and $50\%$ interval coverage & width, PIT histograms, ensemble mean/median RMSE & MAE (best-of-$M$ strictly excluded), generated endpoint volatility calibration, ACF of squared returns, tail quantiles/kurtosis, max drawdowns, and Ledoit–Wolf / sector correlations across calm vs. high-volatility test sub-periods.
+
+## 10.3 Complete Ablation Matrix (Including Experiment R & Dual Compute Parity)
+
+**Dual Compute-Parity Rule for Exp I vs. Exp G:** Report two separate comparisons between Exp I (Two-Stage Sequential) and Exp G (Alternating):
+* **Comparison A (Optimizer-step matched):** Identical prior and DiT gradient step counts.
+* **Comparison B (Compute matched):** Equal total GPU wall-clock training time and estimated FLOPs (accounting for Block A's $2KM$ frozen DiT rollouts), plotted as **Probabilistic Score vs. Total Computational Budget**.
+
+| ID | Configuration | Isolates / Tests |
+|---|---|---|
+| **A** | Standard $\mathcal{N}(0, I)$ source + standard MSE CFM | Primary generative baseline |
+| **R** | **Direct Prior-Only Forecasting ($0$ NFE):** sample $\hat{Y} = \mathcal{P}_p^{-1}(\xi_0)$ from $P_\psi$ (NLL-only and NLL+$\widehat{\text{SW}}_2^2$) without DiT | Quantifies exact joint multivariate value added by the Flow Matching DiT |
+| **B** | Two-Stage Sequential: Gaussian NLL prior $\rightarrow$ freeze $\rightarrow$ CFM | Value of conditional marginal NLL prior alone |
+| **C** | Two-Stage Sequential: Local $\widehat{\text{SW}}_2^2$ / Sinkhorn prior $\rightarrow$ freeze $\rightarrow$ CFM | Value of local distributional transport alone |
+| **D** | Alternating with **only** Straightness PG + KL (no NLL/dist) | Whether straightness alone collapses or stabilizes |
+| **E** | Simultaneous prior + generator updates | Coupled non-stationarity vs. alternation |
+| **F** | Alternating with fixed $\mathcal{N}(0, I)$ KL reference | Moving KL reference vs. permanent Gaussian anchor |
+| **G** | **Full v4.3 Proposed Method** (Alternating + Straightness PG + Moving KL + Dual EMA) | Complete proposed system |
+| **H** | Full v4.3 with $\lambda_{\text{straight}} = 0$ (no generator coupling in Block A) | Proves generator coupling drives alternating gains |
+| **I** | **Two-Stage Sequential Baseline** (Comparison A: step-matched; Comparison B: FLOPs/wall-clock-matched) | Mandatory falsification test for alternating optimization |
+| **J** | Full v4.3 without EMA networks | Value of dual EMA snapshots |
+| **K** | Full v4.3 without KL trust region ($\beta_b = 0$) | Value of trust-region control |
+| **L** | **Primary Coupling Study:** Same-context independent coupling vs. Symmetric-KL-Masked Local OT Approximation | Core transport-efficiency coupling study |
+| **M1** | Independent RLOO vs. Pair-Level Antithetic RLOO vs. Token-Level RLOO across $M \in \{20, 64, 128\}$ (plus clipping ablation) | Policy-gradient variance, bias, and rollout-cost trade-off |
+| **M2** | Uniform vs. Logit-Normal flow-time sampling | Flow-time allocation ablation |
+| **M3** | Full checkpointed ODE backprop vs. truncated / FlowBP-style sparse gradients (when $\lambda_{\text{ES}}, \lambda_{\text{VS}} > 0$) | Auxiliary score gradient compute efficiency |
+| **N** | **Source-Mismatch Negative Control:** Adapted prior at rollout, $\mathcal{N}(0, I)$ in CFM training | Directly verifies necessity of source-matched CFM |
+| **O** | Patch size $p \in \{1, 2, 4\}$ and Block A stride $S \in \{5, 10, 20\}$ | Temporal granularity and target-overlap sensitivity |
+| **P** | MSE CFM vs. Pseudo-Huber CFM vs. Tail-Weighted MSE | Robustness vs. exact conditional-mean velocity field |
+| **Q** | Constant-velocity straightness vs. Solver-aware consistency $\mathcal{L}_{\text{solver}}$ & Low-Rank Factor Prior $\Sigma_\psi = D_\psi + B_\psi B_\psi^\top$ | Stage 6 efficiency & prior expressivity extensions |
+
+## 10.4 Separate Mode: Reward-Tilted Scenario Generation
+
+Unbiased probabilistic forecasting must never be conflated with stress-testing. To generate targeted scenarios (crashes, volatility spikes, correlation breakdowns), explicitly tilt the training target distribution $p_R(Y^{\text{patch}} \mid h_t) \propto p_{\text{data}}(Y^{\text{patch}} \mid h_t)\exp(R(Y, h_t)/T_R)$ and train a separate importance-weighted CFM model toward $p_R$, evaluating it strictly as scenario generation rather than calibrated forecasting.
+
+---
+
+# 11. Concrete Engineering Implementation Plan
+
+## 11.1 Repository & Modular Codebase Layout
+
+Design the codebase so Stage 1 runs completely standalone while leaving clean, zero-refactor extension hooks for Stages 2--6:
+
+```text
+finflow_dit/
+├── configs/
+│   ├── base_data.yaml             # Universe, cal_prefix=252, L=60, H=20, purge=25, p in {1,2,4}
+│   ├── stage1_baseline_cfm.yaml   # Exp A: N(0,I) source, MarketEncoder + PatchedFlowDiT
+│   ├── stage2_static_prior.yaml   # Exps R, B, C: Dual-head prior + NLL + SW2/Sinkhorn
+│   ├── stage3_coupling_ot.yaml    # Exp L: Symmetric-KL masked log-domain Sinkhorn OT
+│   ├── stage4_straightness.yaml   # Exp M1: Frozen EMA DiT + FP32 Heun straightness RLOO
+│   └── stage5_alternating.yaml    # Exps G, H, I: Full alternating loop + dual parity + rho=1 calib
+├── data/
+│   ├── download_and_clean.py      # Adjusted daily OHLCV + index/sector alignment + corporate-action checks
+│   ├── preprocessing.py           # Cal-prefix s_min, past-only s_{i,t}, 12 features, LW correlation graphs A_t
+│   ├── dataset.py                 # Chronological splits, 25-day purge, Patcher(p), Block A strided random-offset loader
+│   └── test_leakage.py            # Pytest suite: future-perturbation 0.0 delta test + shape/purge assertions
+├── models/
+│   ├── market_encoder.py          # Temporal Transformer + Signed-Edge GATv2 + AttentionPool -> (h_stocks, h_global)
+│   ├── patched_dit.py             # Configurable 250/500/1000-token spatiotemporal DiT + AdaLN-Zero + zero-init head
+│   ├── source_prior.py            # Dual-head bounded Gaussian (mu_head bias=0, scale_head bias=b0), log_prob_sum/per_dim
+│   └── ema_utils.py               # EMA wrappers, frozen_copy, FrozenMixture, matched (prior, dit) pair checkpointing
+├── flow/
+│   ├── ode_solvers.py             # FP32 Euler/Heun/RK4/Dopri5 + exact Heun straightness + NFE/wall-clock profiler
+│   ├── transport.py               # Local neighborhoods, consistent Sinkhorn Div, MC SW2^2, symmetric-KL masked OT + fallback
+│   ├── rloo.py                    # Independent & Pair-Level Antithetic RLOO + past-batch RunningEMAStd + grad-norm logger
+│   └── metrics.py                 # Unbiased Energy Score, Explicit 3-subset Variogram Score, CRPS, PIT, coverage, LW corr
+├── baselines/
+│   └── classical.py               # Historical block bootstrap + Multivariate EWMA/DCC-GARCH benchmark
+├── scripts/
+│   ├── train_stage1_cfm.py        # Stage 1: Baseline Gaussian CFM + NFE={4,8,16,32,64} sweep
+│   ├── train_stage2_prior.py      # Stage 2: Static prior + Exp R (0-NFE) + Exps B/C
+│   ├── train_stage3_coupling.py   # Stage 3: Independent vs. KL-masked local OT study
+│   ├── train_stage4_rloo_check.py # Stage 4: Frozen-generator straightness PG verification
+│   ├── train_stage5_alt.py        # Stage 5: Full alternating loop + post-rho=1 calibration + Exp I parity
+│   └── evaluate_test.py           # Untouched test-set evaluation, Diebold-Mariano/block-bootstrap, calm vs. crash audit
+└── tests/
+    ├── test_math_identities.py    # Heun straightness == 0 on constant vel; dual-head init == N(0,I); RLOO zero-mean grad check
+    └── test_ot_and_metrics.py     # Diagonal Sinkhorn feasibility + fallback; SW2^2 == 0 for P=Q; Variogram exactness check
+```
+
+## 11.2 Fast-Prototyping & Compute Protocol
+
+1. **Tech stack:** PyTorch 2.x (`torch.compile` on DiT blocks), `bf16` autocast for forward/backward DiT passes with strictly `fp32` ODE states/accumulators/Sinkhorn dual potentials, Hydra configs, Weights & Biases (`wandb`) logging, and `pytest` for mathematical unit tests.
+2. **Small-scale smoke track first:** Before running $N = 50$ full grids, run Stages 1--5 on a fast **$N = 15$ liquid-equity subset** ($D = 300$, $75$ DiT tokens at $p = 4$) on a single 24GB GPU (e.g., RTX 3090/4090 or A10G). Every mathematical identity, gradient flow, and Stage 1--5 gate should pass end-to-end in hours before scaling to $N = 50$.
+3. **Compute accounting:** Log exact wall-clock seconds, peak VRAM, total DiT forward/backward FLOPs, and total NFE for every run so Comparison B (Compute-Matched Exp I vs. Exp G) is automatic rather than reconstructed post-hoc.
+
+## 11.3 Gated 6-Stage Execution Schedule, Deliverables & Mandatory Exit Gates
+
+Do **not** advance to the next stage until every exit gate of the current stage passes on the validation split.
+
+| Stage | Modules Built & Executed | Mandatory Unit Tests & Diagnostics | Strict Quantitative Exit Gate |
 |---|---|---|---|
-| A | Standard Gaussian | Standard diffusion training | Baseline |
-| B | Adaptive prior | Frozen generator | Prior adaptation alone |
-| C | Standard Gaussian | Reward-fine-tuned generator | Generator adaptation alone |
-| D | Adaptive prior | Simultaneous updates | Test coupled optimization |
-| E | Adaptive prior | Alternating, Gaussian KL reference | Test alternation |
-| F | Adaptive prior | Alternating, moving prior reference | Test progressive adaptation |
-| G | Adaptive prior | Moving reference + trust region + separate EMA | Full proposed method |
-
-Additional ablations:
-
-- No Gaussian anchor versus a small Gaussian anchor.
-- Fixed KL coefficient versus adaptive trust-region multiplier.
-- Different prior and generator block lengths.
-- Different elite counts and reward temperatures.
-- Reward-weighted MLE/CEM versus policy-gradient prior updates.
-- Diagonal Gaussian versus low-rank Gaussian or conditional normalizing flow.
-- RMSE-only reward versus combined sample and ensemble rewards.
-- Separate EMA rates and EMA snapshot schedules.
-
-The comparison between simultaneous and alternating updates is essential. The comparison between a fixed Gaussian reference and a moving learned-prior reference isolates the benefit of progressive prior adaptation.
-
----
-
-# 15. Failure modes and mitigation
-
-## 15.1 Prior collapse
-
-**Failure:** The prior concentrates on a very narrow latent region, generating nearly identical trajectories.
-
-**Mitigation:** KL trust region, variance floor, reward temperature, fresh candidate sampling, entropy monitoring, and ensemble-level scoring rules.
-
-## 15.2 Overfitting to individual historical windows
-
-**Failure:** The prior memorizes latent vectors that perform well on a small set of training examples.
-
-**Mitigation:** Train across many chronological windows, draw fresh candidates after prior updates, use chronological validation, and evaluate on unseen regimes.
-
-## 15.3 Reward exploitation
-
-**Failure:** The generator reduces RMSE while producing unrealistic or overly smooth trajectories.
-
-**Mitigation:** Retain diffusion and reconstruction losses, use distributional scores, evaluate financial statistical properties, and monitor ensemble diversity.
-
-## 15.4 Prior–generator oscillation
-
-**Failure:** The prior changes faster than the generator adapts, producing alternating degradation and recovery.
-
-**Mitigation:** Moving-reference KL trust region, separate EMA snapshots, conservative learning rates, alternating blocks, and validation-based block stopping.
-
-## 15.5 Decoder degradation
-
-**Failure:** The decoder specializes to elite trajectories and loses general reconstruction capability.
-
-**Mitigation:** Retain VAE reconstruction loss, freeze the future encoder, use a conservative decoder learning rate, and evaluate on held-out future latents.
-
-## 15.6 Terminal-prior mismatch
-
-**Failure:** The learned terminal prior samples regions that the pretrained DiT has not learned to denoise.
-
-**Mitigation:** Limit each prior update with KL trust region, train the generator on a mixture of old and new priors, retain the standard diffusion loss, and measure performance separately on old-prior and new-prior samples.
-
-This is a central scientific risk of the project. A learned terminal prior is useful only if the adapted reverse process can reliably transform its samples into valid future trajectories.
-
-## 15.7 Noisy reward estimates
-
-**Failure:** Short future horizons make volatility and correlation reward estimates unreliable.
-
-**Mitigation:** Begin with RMSE, use longer horizons for statistical rewards, use shrinkage covariance estimates, aggregate across windows, and normalize reward components.
-
----
-
-# 16. Suggested implementation roadmap
-
-## Stage 1: Data pipeline and simple baselines
-
-- Construct the financial universe and historical data.
-- Create past/future rolling windows.
-- Implement adjusted-return processing and scaling.
-- Create chronological splits and leakage checks.
-- Establish simple forecasting baselines.
-
-**Deliverable:** Reliable multivariate financial training and evaluation dataset.
-
-## Stage 2: Historical market encoder
-
-- Implement the temporal Transformer.
-- Construct historical stock relationship graphs.
-- Implement graph aggregation.
-- Add global market-context pooling.
-- Evaluate representation quality.
-
-**Deliverable:** Historical context representation `h_t`.
-
-## Stage 3: Future trajectory autoencoder
-
-- Implement future trajectory encoder.
-- Implement trajectory decoder.
-- Train VAE reconstruction objective.
-- Evaluate reconstruction and latent stability.
-- Freeze the future encoder for initial diffusion experiments.
-
-**Deliverable:** Stable future latent space and decoder.
-
-## Stage 4: Conditional latent DiT
-
-- Implement forward diffusion.
-- Implement conditional DiT.
-- Train epsilon or velocity prediction.
-- Use a standard Gaussian terminal distribution.
-- Evaluate generated trajectory distribution.
-
-**Deliverable:** Functional baseline latent diffusion forecaster.
-
-## Stage 5: Adaptive terminal prior
-
-- Initialize conditional Gaussian prior near standard normal.
-- Freeze EMA generator.
-- Generate multiple candidates.
-- Calculate RMSE.
-- Select elites.
-- Train prior using weighted likelihood and moving-reference KL.
-
-**Deliverable:** Reward-adaptive terminal prior.
-
-## Stage 6: Alternating generator refinement
-
-- Construct fixed mixture of previous and new prior snapshots.
-- Freeze prior snapshots.
-- Fine-tune DiT and decoder.
-- Retain diffusion and reconstruction objectives.
-- Add elite and ensemble losses.
-- Update generator EMA.
-
-**Deliverable:** Complete alternating prior–generator optimization.
-
-## Stage 7: Advanced rewards and ablations
-
-- Introduce volatility and dependence objectives.
-- Add Energy Score and Variogram Score.
-- Compare CEM-style updates with policy gradients.
-- Compare simultaneous and alternating optimization.
-- Compare fixed and moving KL references.
-- Measure calibration and out-of-distribution performance.
-
-**Deliverable:** Controlled research results and ablation studies.
-
-## Stage 8: Analysis interface
-
-Build an interface that allows a researcher to inspect:
-
-- Multiple generated future trajectories.
-- Prediction intervals and uncertainty.
-- Cross-stock correlation scenarios.
-- Tail-risk scenarios.
-- Regime-conditioned forecasts.
-- Historical periods that resemble generated scenarios.
-
-**Deliverable:** Interactive financial market research and scenario-analysis system.
-
----
-
-# 17. Initial experimental configuration
-
-These values are starting points for experimentation, not optimized settings.
-
-| Parameter | Initial configuration |
-|---|---|
-| Market | Indian equities |
-| Number of stocks | 30–50 |
-| Lookback | 60 trading days |
-| Forecast horizon | 20 trading days |
-| Historical features | 10–15 per stock |
-| Future target | Normalized log returns |
-| Historical encoder | Temporal Transformer + Graph Encoder |
-| Future representation | VAE |
-| Latent dimension | 64–128 |
-| Denoiser | Conditional DiT |
-| Diffusion training steps | 100–500 initially |
-| Terminal prior | Conditional diagonal Gaussian |
-| Candidate trajectories | 20 initially |
-| Elite trajectories | 4–5 initially |
-| Prior block | 10 epochs initially |
-| Generator block | 10 epochs initially |
-| Prior update | Reward-weighted MLE / CEM initially |
-| Prior regularization | KL to previous EMA prior |
-| Generator update | Differentiable reward fine-tuning |
-| Prior EMA decay | 0.995 initially |
-| Generator EMA decay | 0.999 initially |
-
-The number of epochs per block should be ablated. A fixed 10/10 schedule is a starting design, not a requirement. Validation-based stopping or adaptive block lengths may be preferable.
-
----
-
-# 18. Research contributions and hypotheses
-
-The individual ingredients—conditional latent diffusion, DiT, reward-guided diffusion optimization, initial-noise adaptation, elite-sample optimization, alternating updates, and EMA—have each appeared in related machine-learning research. The project should not claim novelty simply from combining them.
-
-The contribution should be formulated around their interaction for multivariate financial trajectory generation.
-
-## Hypothesis 1: Adaptive financial terminal prior
-
-A context-dependent terminal prior can improve the quality of generated future trajectories compared with a fixed Gaussian terminal distribution.
-
-## Hypothesis 2: Progressive prior–generator co-adaptation
-
-Progressively adapting the terminal prior while periodically refining the generator can improve the generator's ability to use useful latent regions without causing the instability associated with simultaneous updates.
-
-## Hypothesis 3: Moving-reference trust-region optimization
-
-A moving learned-prior KL reference, combined with trust-region control and separate EMA snapshots, can produce more stable prior updates than either an unrestricted prior or a prior permanently anchored to the original Gaussian.
-
-## Hypothesis 4: Distributional quality under market shifts
-
-Reward-guided adaptation can improve probabilistic forecast quality while preserving diversity, calibration, and cross-asset dependence, including in previously unseen market regimes.
-
-A particularly interesting analysis is whether the learned prior parameters vary systematically with market representations and whether these changes generalize across unseen historical periods.
-
----
-
-# 19. Final architecture summary
-
-The full model can be written compactly as follows.
-
-Historical representation:
-
-\[
-h_t=E_\phi(X_t^{\mathrm{past}}).
-\]
-
-Training-only future latent:
-
-\[
-z_0\sim q_\chi(z_0\mid Y_t,h_t).
-\]
-
-Diffusion forward process:
-
-\[
-z_k=\sqrt{\bar\alpha_k}z_0
-+\sqrt{1-\bar\alpha_k}\eta.
-\]
-
-Conditional terminal prior:
-
-\[
-z_K\sim P_\psi(z_K\mid h_t).
-\]
-
-Reverse DiT and trajectory decoder:
-
-\[
-\boxed{
-\hat Y_t=
-D_\omega(R_{\theta_D}(z_K,h_t),h_t).
-}
-\]
-
-The training process alternates between:
-
-**Prior block:**
-
-\[
-\boxed{
-\begin{aligned}
-\min_\psi\quad
-&-\mathbb E_{\mathrm{elite}}[\log P_\psi(z_K\mid h_t)]
-\\
-&+\beta_bD_{KL}\left(
-P_\psi(\cdot\mid h_t)
-\Vert P_{\bar\psi^{(b)}}(\cdot\mid h_t)
-\right)
-+\gamma_{\mathrm{var}}\mathcal L_{\mathrm{var}}.
-\end{aligned}
-}
-\]
-
-**Generator block:**
-
-First define the fixed sampling distribution:
-
-\[
-q_b=
-\rho P_{\bar\psi^{(b+1)}}
-+(1-\rho)P_{\bar\psi^{(b)}}.
-\]
-
-Then optimize:
-
-\[
-\boxed{
-\begin{aligned}
-\min_\theta\quad
-\mathbb E_{z_K\sim q_b}\big[
-&\lambda_{\mathrm{diff}}\mathcal L_{\mathrm{diff}}
-+\lambda_{\mathrm{recon}}\mathcal L_{\mathrm{recon}}
-\\
-&+\lambda_{\mathrm{elite}}\mathcal L_{\mathrm{elite}}
-+\lambda_{ES}\mathcal L_{ES}
-+\lambda_{VS}\mathcal L_{VS}
-\big].
-\end{aligned}
-}
-\]
-
-Separate EMA networks are updated after their corresponding online updates. The next outer iteration uses the updated EMA prior as the new moving reference and the updated EMA generator as the fixed generator reference for the prior block.
-
----
-
-# 20. Final recommendations
-
-The recommended first implementation is deliberately conservative:
-
-1. Use 30–50 stocks and daily normalized returns.
-2. Build a temporal-plus-graph historical encoder.
-3. Train a future trajectory VAE and freeze its future encoder.
-4. Train a conditional latent DiT with a standard Gaussian terminal distribution.
-5. Introduce a conditional diagonal-Gaussian terminal prior initialized near standard normal.
-6. Use RMSE-based top-`K` elite selection and reward-weighted prior likelihood updates.
-7. Regularize each new prior against the previous EMA prior using a KL trust region.
-8. Fine-tune the DiT and trajectory decoder in a separate block using a fixed mixture of old and new prior snapshots.
-9. Retain the diffusion and decoder reconstruction objectives while adding elite and ensemble reward losses.
-10. Maintain separate EMA copies and evaluate complete ensembles without ground-truth-based candidate selection.
-
-The highest-risk technical assumption is that a changed terminal prior can be paired with a reverse process that was originally trained under a Gaussian terminal distribution. The alternating generator-refinement block is intended to address this mismatch, but the experiment must directly test it. Monitor performance on old-prior and new-prior samples separately and retain standard diffusion training as an anchor.
-
-The most important research result will not simply be a lower training RMSE. It will be evidence that the learned prior and adapted generator produce better calibrated, diverse, statistically realistic multivariate financial trajectories on strictly unseen future periods.
-
-**Proposed project title:**
-
-> **Progressive Reward-Guided Prior Adaptation with Alternating Generator Refinement for Latent Financial Diffusion Models**
-
-**Central research question:**
-
-> Can a conditional diffusion terminal prior be progressively optimized using trajectory-level reward feedback, while alternating generator refinement with moving-reference trust-region regularization, to improve probabilistic multivariate financial forecasting without sacrificing calibration, diversity, and cross-asset dependence?
+| **Stage 1: Data, Classical Baselines & Baseline Patched CFM (Exp A)** | `preprocessing.py`, `dataset.py`, `test_leakage.py`, `classical.py`, `market_encoder.py`, `patched_dit.py`, `ode_solvers.py`, `metrics.py`, `train_stage1_cfm.py` | Zero-leakage perturbation test (`0.0` delta on $X_t, s_{i,t}, A_t$); Heun straightness $= 0$ on synthetic constant-velocity field; GNN signed edge sparsity log. | All leakage & math tests pass; Exp A beats Historical Bootstrap on validation Energy Score & Factored Variogram Score; $90\%$ interval coverage inside $[85\%, 95\%]$; baseline Pareto curve logged over $\text{NFE} \in \{4, 8, 16, 32, 64\}$. |
+| **Stage 2: Static Conditional Prior & Direct Prior Baseline (Exps R, B, C)** | `source_prior.py`, `transport.py` (local neighborhoods, consistent Sinkhorn Div, MC $\widehat{\text{SW}}_2^2$), `train_stage2_prior.py` | Dual-head init asserts $\mu_\psi \equiv 0, \sigma_\psi \equiv 1$; $\widehat{\text{SW}}_2^2$ convergence across $L_{\text{proj}} \in \{128, 256, 512\}$ and multiple seeds; prior boundary saturation check. | Confirmed reduction in source-to-target displacement vs. $\mathcal{N}(0, I)$; $\sigma_\psi$ saturation $< 5\%$; Exp A / B / C clearly beat Exp R ($0$-NFE prior-only) on Factored Variogram Score & LW correlation error (proving DiT value); generated endpoint volatility calibrated. |
+| **Stage 3: Primary Coupling Study (Exp L)** | `transport.py` (symmetric convexity upper-bound mask, masked log-domain Sinkhorn, uniform marginals, fallback), `train_stage3_coupling.py` | Diagonal feasibility & fallback unit test; log off-diagonal match rate, Sinkhorn marginal error $< 10^{-4}$, fallback rate, and $S = 128$ MC symmetric mixture KL ($\pm$ SE). | Clean comparison of coupling-indexed $D_{\text{transport}}(\pi)$, straightness cost, and validation proper scores for Independent vs. KL-Constrained Local OT; choose canonical coupling for Stages 4--5. |
+| **Stage 4: Generator-Dependent Straightness PG Verification (Exp M1)** | `rloo.py` (Independent RLOO, Pair-Level Antithetic RLOO, past-batch `RunningEMAStd`, clip-rate & grad-norm ratio logger), `train_stage4_rloo_check.py` | Synthetic zero-mean score-function unbiasedness test (before clipping); Spearman rank correlation of $\hat{C}_{\text{straight}}^{(K)}$ across $K \in \{4, 8, 16, 32\}$; `dit_ref.eval()` determinism check. | Monotonic drop in validation $\hat{C}_{\text{straight}}^{(K)}$ under frozen EMA DiT; multi-$K$ Spearman rank correlation $> 0.85$; $\lambda_{\text{straight}}$ calibrated via live grad-norm ratio; clipping activation logged ($< 10\%$). |
+| **Stage 5: Full Alternating Loop vs. Compute-Matched Sequential (Exps G, H, I)** | `ema_utils.py` (dual EMAs, `FrozenMixture`, matched pair checkpoints), `train_stage5_alt.py` (Block A/B loop, epoch dual $\beta_b$, dual validation, $\rho = 1$ final calibration) | Three-point straightness oscillation log (pre-B $\to$ post-B $\to$ next-A); pre- vs. post-calibration validation check; dual parity plots (step-matched AND wall-clock/FLOPs-matched Exp I vs. G). | Stable per-dim KL tracking $\delta$; Exp G achieves lower straightness cost and matches or improves low-NFE ($4\text{--}8$ NFE) Energy & Variogram Scores vs. Exp H ($\lambda_{\text{straight}} = 0$) and compute-matched Exp I without losing calibration. |
+| **Stage 6: Efficiency Extensions, Full Ablations & Untouched Test Audit** | `evaluate_test.py` + Exps D, E, F, J, K, M2, M3 (FlowBP), N (source-mismatch control), O ($p \in \{1,2,4\}$, $S \in \{5,10,20\}$), P (Huber), Q ($\mathcal{L}_{\text{solver}}$, low-rank prior) | Multi-seed runs ($\ge 3$ seeds); Diebold–Mariano & block-bootstrap significance tests; calm vs. high-volatility/crash test regime slices. | Final untouched test-set Pareto frontier (Probabilistic Score vs. NFE & Wall-Clock Time) and full falsifiable ablation table completed. |
+
+## 11.4 Initial Default Hyperparameter Table
+
+| Parameter | Default Value | Parameter | Default Value |
+|---|---|---|---|
+| Universe / Cal Prefix / Purge | $N = 50$ ($N = 15$ smoke), $T_{\text{cal}} = 252$, $25$ days | Lookback / Horizon / Features | $L = 60$, $H = 20$, $F = 12$ |
+| Patch size $p$ / State dim $D$ | $p = 4$ (ablate $1, 2$), $D = 1,000$ | DiT width / Layers / Heads | $d_{\text{model}} = 128$, $L_{\text{DiT}} = 6$, $8$ heads |
+| Prior bounds $(\sigma_{\min}, \sigma_{\max})$ | $(0.20, 4.00)$, dual-head init $\mathcal{N}(0, I)$ | Block A rollouts $M$ / Stride $S$ | $M = 20$ (ablate $64, 128$), $S = 5$ (ablate $10, 20$) |
+| Eval NFE grid / Block A Heun $K$ | $\text{NFE} \in \{4, 8, 16, 32, 64\}$ / $K = 8$ | Local group $B_g$ / $\widehat{\text{SW}}_2^2$ projs | $B_g = 24$, $L_{\text{proj}} = 256$ (ablate $128, 512$) |
+| KL budget $\delta$ / Dual step $\eta_\beta$ | $0.03$ nats/coord, $\eta_\beta = 0.5$ | Context OT KL threshold $\delta_{\text{context}}$ | $0.05$ nats/coord (symmetric upper bound) |
+| Mixture weight $\rho$ | $0.70$ (final calib $\rho = 1.0$) | Loss weights $(\lambda_{\text{NLL}}, \lambda_{\text{dist}}, \lambda_{\text{straight}})$ | $(1.0, 0.5, \text{calibrated via grad-norm ratio})$ |
+| EMA decays $(\alpha_P, \alpha_G)$ | $(0.995, 0.999)$ | Outer iterations / Epochs per block | $B_{\text{outer}} = 6\text{--}10$, $5\text{--}8$ epochs |
